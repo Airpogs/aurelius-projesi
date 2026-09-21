@@ -9,9 +9,20 @@ v17 FIX - BINANCE TR CANLI MOD API ENTEGRASYON DUZELTMESI (bakiye hep
   1) BASE_URL + ACCOUNT_ENDPOINT_PATH duzeltildi: "https://www.binancetr.com"
      + "/open-api/v3/account" (Binance Global stili, YANLIS) yerine
      kullanicidan teyitli "https://www.binance.tr" + "/open/v1/account/spot"
-     kullaniliyor. ORDER_ENDPOINT_PATH bu revizyonda DOGRULANMADI - CANLI_MOD
-     ile ilk GERCEK emirden once mutlaka kendi Binance TR API dokumantasyonunuzdan
-     teyit edin (canli_mod_on_kontrol() bunu her CANLI baslangicta hatirlatir).
+     kullaniliyor.
+  1b) ORDER_ENDPOINT_PATH ARASTIRILDI VE GUNCELLENDI: "/open-api/v3/order"
+     (Binance Global stili, kesinlikle yanlis) yerine "/open/v1/orders"
+     (POST) kullaniliyor - bu yol, Binance TR'yi hedefleyen bagimsiz/acik
+     kaynakli bir topluluk kutuphanesinin (github.com/futuristicexchanger/
+     BinanceTrApi) incelenmesiyle bulundu; kutuphanenin hesap/bakiye yolu
+     kullanicinin CANLI ortamda ZATEN dogruladigi yolla birebir ayni oldugu
+     icin guven duzeyi yuksek kabul edildi. AYRICA bu kaynaga gore Binance
+     TR "side"/"type" alanlarini "BUY"/"MARKET" METIN olarak degil SAYISAL
+     KOD olarak bekliyor - binance_gercek_emir_gonder() artik ORDER_SIDE_
+     KODU/ORDER_TIPI_MARKET_KODU ile bu donusumu yapiyor. YINE DE BU RESMI
+     BINANCE TR DOKUMANTASYONU DEGILDIR - canli_mod_on_kontrol() her CANLI
+     baslangicta ilk emri KUCUK bir tutarla test edip [BORSA YANITI]
+     satirini borsa arayuzuyle karsilastirmanizi hatirlatir.
   2) API anahtarlari artik _ortam_degiskeni_str_oku() ile okunuyor - ortam
      degiskeni yanlislikla tuple/list olursa (orn. tanim satirinin sonunda
      unutulan bir virgul) ANINDA, net bir Turkce hata ile durur; artik
@@ -540,16 +551,35 @@ DEPTH_URL_TEMPLATE = "https://api.binance.me/api/v3/depth?symbol={symbol}&limit=
 # "binancetr.com" / "/open-api/v3/account" (Binance Global stili) adresler
 # Binance TR icin YANLISTI ve bakiyenin hep 0.00 TRY donmesine yol aciyordu.
 #
-# !!! ONEMLI: ORDER_ENDPOINT_PATH bu duzeltmede DOGRULANMADI (kullanicidan
-# sadece hesap/bakiye uc noktasi icin teyit alindi). Ayni "/open/v1/..."
-# aile yapisina tasinmis olmasi COK MUHTEMEL ama TEYIT EDILMEDI - CANLI_MOD=True
-# ile GERCEK EMIR gondermeden once bu yolu MUTLAKA kendi Binance TR API
-# dokumantasyonunuzdan/API saglayicinizdan dogrulayin. canli_mod_on_kontrol()
-# bu konuda ayrica bir uyari basar.
+# !!! ONEMLI - ORDER_ENDPOINT_PATH KAYNAK NOTU: Binance TR'nin ozel API'si
+# icin resmi, genis capli indekslenmis bir dokumantasyon YOKTUR. Asagidaki
+# "/open/v1/orders" yolu, Binance TR'yi hedefleyen BAGIMSIZ/ACIK KAYNAKLI bir
+# topluluk kutuphanesinin incelenmesiyle bulundu
+# (github.com/futuristicexchanger/BinanceTrApi, BinanceTrService.py +
+# constants.json) - bu kutuphanenin hesap/bakiye yolu ("/open/v1/account/spot")
+# SIZIN CANLI ORTAMDA ZATEN DOGRULADIGINIZ yol ile BIREBIR AYNI oldugu icin
+# guvenilirligi ARTMIS kabul edildi, ANCAK bu RESMI Binance TR dokumantasyonu
+# DEGILDIR ve emir uc noktasi bizzat SIZIN TARAFINIZDAN test edilmedi.
+# AYRICA ONEMLI: bu kaynaga gore Binance TR, "side"/"type" alanlarini
+# Binance Global gibi "BUY"/"MARKET" METIN olarak DEGIL, SAYISAL KOD olarak
+# bekliyor (bkz. ORDER_SIDE_KODU/ORDER_TIPI_MARKET_KODU asagida ve
+# binance_gercek_emir_gonder()). GERCEK PARAYLA ILK EMIRDEN ONCE MUTLAKA
+# en kucuk (minNotional'a yakin) bir tutarla TEK bir test emri gonderip
+# konsoldaki [BORSA YANITI] satirini borsa arayuzunuzdeki islem gecmisiyle
+# KARSILASTIRARAK dogrulayin. canli_mod_on_kontrol() bu konuda ayrica bir
+# uyari basar.
 BINANCE_TR_PRIVATE_BASE_URL = "https://www.binance.tr"
 ACCOUNT_ENDPOINT_PATH = "/open/v1/account/spot"
-ORDER_ENDPOINT_PATH = "/open-api/v3/order"  # !!! DOGRULANMADI - asagidaki uyariya bakin
+ORDER_ENDPOINT_PATH = "/open/v1/orders"  # v17 FIX: bkz. yukaridaki KAYNAK NOTU - RESMI DOGRULAMA hala YOK
 RECV_WINDOW_MS = 5000
+
+# v17 FIX: Binance TR'nin emir API'si (yukaridaki kaynak notuna gore)
+# side/type alanlarini metin degil SAYISAL KOD olarak bekliyor gibi
+# gorunuyor. Bu esleme SADECE BUY/SELL MARKET emirleri icin (botun kullandigi
+# tek emir turu) - Binance Global stili "BUY"/"SELL"/"MARKET" sabitlerini
+# bu kodlara cevirir.
+ORDER_SIDE_KODU = {"BUY": "0", "SELL": "1"}
+ORDER_TIPI_MARKET_KODU = "2"
 
 # v10 - Tahta derinligi / spread filtresi
 ORDERBOOK_DEPTH_LIMIT = 5
@@ -1310,22 +1340,35 @@ def miktari_lot_size_yuvarla(qty: float, step_size: Optional[float]) -> float:
 
 
 def binance_gercek_emir_gonder(symbol: str, side: str, quantity: float) -> dict:
-    """ORDER_ENDPOINT_PATH uc noktasina GERCEK MARKET emri gonderir
-    (HMAC-SHA256 imzali). !!! v17 FIX notu: ORDER_ENDPOINT_PATH bu
-    revizyonda DOGRULANMADI (bkz. canli_mod_on_kontrol() uyarisi) - CANLI
-    ile ilk emirden once mutlaka teyit edin. side: 'BUY' veya 'SELL'.
+    """
+    ORDER_ENDPOINT_PATH (v17 FIX: /open/v1/orders, POST) uc noktasina
+    GERCEK MARKET emri gonderir (HMAC-SHA256 imzali).
+
+    !!! KAYNAK/GUVEN NOTU: Bu yol VE asagidaki side/type SAYISAL KOD
+    eslemesi, Binance TR'yi hedefleyen bagimsiz bir topluluk kutuphanesinin
+    incelenmesiyle bulundu (bkz. ORDER_ENDPOINT_PATH tanimindaki uzun
+    yorum). Hesap/bakiye yolu SIZIN CANLI ortamda dogruladiginiz yolla
+    BIREBIR ayni oldugu icin guven duzeyi yuksek, ama RESMI Binance TR
+    dokumantasyonu ile teyit edilmedi. side: 'BUY' veya 'SELL' (Binance
+    Global stili metin) - ORDER_SIDE_KODU ile SAYISAL KODA ("0"/"1")
+    cevrilir; type sabit olarak ORDER_TIPI_MARKET_KODU ("2") gonderilir.
     LOT_SIZE/minNotional kontrolu cagiran taraf
     (CoinBot._canli_emir_dogrula_ve_gonder) tarafindan ONCEDEN yapilmis
     olmalidir. Bu fonksiyon partial-fill (kismi gerceklesme) durumunu
     ayrica sorgulamaz - tek seferlik MARKET emri gonderir ve borsanin
-    dondurdugu yaniti aynen dondurur."""
+    dondurdugu yaniti aynen dondurur (ham yaniti da [BORSA YANITI] ile
+    terminale basar - GERCEK PARAYLA ILK EMIRDEN SONRA bu satiri borsa
+    arayuzunuzdeki islem gecmisiyle MUTLAKA karsilastirin).
+    """
     params = {
         "symbol": symbol,
-        "side": side,
-        "type": "MARKET",
+        "side": ORDER_SIDE_KODU.get(side, side),
+        "type": ORDER_TIPI_MARKET_KODU,
         "quantity": f"{quantity:.8f}".rstrip("0").rstrip("."),
     }
-    return binance_signed_request("POST", ORDER_ENDPOINT_PATH, params)
+    sonuc = binance_signed_request("POST", ORDER_ENDPOINT_PATH, params)
+    print(f"{GRAY}[BORSA YANITI]: {sonuc!r}{RESET}")
+    return sonuc
 
 
 def canli_mod_on_kontrol() -> bool:
@@ -1360,16 +1403,17 @@ def canli_mod_on_kontrol() -> bool:
               f"bayragin yanlislikla True birakilmasina karsi BILINCLI EK bir korumadir.{RESET}")
         hata_var = True
 
-    # v17 FIX: ORDER_ENDPOINT_PATH bu revizyonda DOGRULANMADI (sadece hesap/
-    # bakiye uc noktasi icin kullanicidan teyit alindi) - BASE_URL degisti
-    # (www.binancetr.com -> www.binance.tr) ama eski "/open-api/v3/order"
-    # yolu ayni bicimde kalmis olabilir/olmayabilir. CANLI_MOD ile GERCEK
-    # EMIR gondermeden once bunu MUTLAKA dogrulayin - bu SADECE bir uyaridir,
-    # botu DURDURMAZ.
-    print(f"{YELLOW}  UYARI: ORDER_ENDPOINT_PATH ({ORDER_ENDPOINT_PATH}) bu revizyonda "
-          f"DOGRULANMADI - GERCEK EMIR gondermeden once Binance TR API "
-          f"dokumantasyonunuzdan/API saglayicinizdan mutlaka teyit edin.{RESET}")
-    logger.warning("ORDER_ENDPOINT_PATH (%s) dogrulanmadi - CANLI_MOD ile ilk emirden once teyit edin.",
+    # v17 FIX: ORDER_ENDPOINT_PATH ("/open/v1/orders") ve side/type sayisal
+    # kod eslemesi bagimsiz bir topluluk kaynagindan geldi (bkz. dosyanin
+    # ustundeki ORDER_ENDPOINT_PATH tanimindaki KAYNAK NOTU) - hesap/bakiye
+    # yoluyla ayni aile oldugu icin guven duzeyi YUKSEK, ama RESMI Binance TR
+    # dokumantasyonuyla TEYIT EDILMEDI. Bu SADECE bir uyaridir, botu DURDURMAZ.
+    print(f"{YELLOW}  UYARI: ORDER_ENDPOINT_PATH ({ORDER_ENDPOINT_PATH}) ve side/type "
+          f"sayisal kod eslemesi RESMI olarak dogrulanmadi (bagimsiz kaynaktan alindi - "
+          f"bkz. kod ici yorum). ILK GERCEK EMRI MUTLAKA en kucuk tutarla gonderip "
+          f"[BORSA YANITI] satirini borsa arayuzunuzdeki islem gecmisiyle karsilastirin.{RESET}")
+    logger.warning("ORDER_ENDPOINT_PATH (%s) ve side/type kod eslemesi resmi olarak "
+                   "dogrulanmadi - ilk CANLI emirden once kucuk tutarla teyit edin.",
                    ORDER_ENDPOINT_PATH)
 
     return not hata_var
