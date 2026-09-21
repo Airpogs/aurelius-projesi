@@ -1192,6 +1192,11 @@ def binance_serbest_try_bakiyesi() -> float:
     tam alan adlandirmasi teyit edilene kadar esneklik icin.
     """
     veri = binance_signed_request("GET", ACCOUNT_ENDPOINT_PATH)
+    # v17 FIX: ham borsa yanitini HER ZAMAN terminale bas - olasi API hata
+    # kodlarini (orn. code=-2015 Invalid API-key) gozle GORMEK icin. Bu,
+    # logger.error ile 'project_aurelius.log' dosyasina yazilan kayda EKtir,
+    # onun yerine gecmez.
+    print(f"{GRAY}[BORSA YANITI]: {veri!r}{RESET}")
     for bakiye in _binance_tr_bakiye_listesini_cikar(veri):
         if not isinstance(bakiye, dict):
             continue
@@ -1235,6 +1240,7 @@ def mutabakat_yap(kasa: "MerkeziKasa", pozisyonlar: dict) -> None:
             logger.warning("Mutabakat: kasa bakiyesi %.2f -> %.2f (fark %.2f)", eski_bakiye, gercek_bakiye, fark)
 
         hesap = binance_signed_request("GET", ACCOUNT_ENDPOINT_PATH)
+        print(f"{GRAY}[BORSA YANITI]: {hesap!r}{RESET}")  # v17 FIX: ham yaniti gozle gor
         # v17 FIX: ayni "data.balances"/"data.assets" zarfi burada da
         # kullaniliyor - eskiden hesap.get("balances", []) hep bos donup
         # coin miktari mutabakati SESSIZCE hicbir sey yapmiyordu.
@@ -2916,14 +2922,24 @@ def run_simulation():
         rapor = RaporlamaDurumu(TOPLAM_SANAL_BAKIYE_TRY)  # v11
         print(f"{YELLOW}  Kayitli durum bulunamadi, temiz baslangic: {TOPLAM_SANAL_BAKIYE_TRY:,.2f} TRY{RESET}\n")
 
-    # v10 BOLUM 4: CANLI MOD ise borsadan gercek bakiyeyi cek ve kasa ile esitle
+    # v17 FIX: CANLI MOD ise borsadan gercek bakiyeyi cek ve kasa ile esitle.
+    # Cekilen gercek serbest TRY tutari SIFIRDAN BUYUKSE, kasa.baslangic VE
+    # kasa.bakiye DOGRUDAN bu tutara esitlenir (onceki oturumdan kayitli
+    # durum olsa BILE) - boylece "hep 0.00 TRY" yanilgisindan sonra ilk
+    # basarili canli baslangicta kasa GERCEK borsa bakiyesiyle net bir
+    # sekilde senkronize olur. Tutar 0 (veya negatif/okunamadi) ise kasa
+    # SESSIZCE sifirlanmaz - mevcut/kayitli deger korunur ve acikca uyarilir.
     if CANLI_MOD:
         try:
             gercek_bakiye = binance_serbest_try_bakiyesi()
             print(f"{GREEN}  CANLI MOD AKTIF - borsadan cekilen serbest TRY bakiyesi: {gercek_bakiye:,.2f} TRY{RESET}\n")
-            kasa.bakiye = gercek_bakiye
-            if not kayitli_durum:
+            if gercek_bakiye > 0:
                 kasa.baslangic = gercek_bakiye
+                kasa.bakiye = gercek_bakiye
+            else:
+                print(f"{YELLOW}  UYARI: Borsadan cekilen serbest TRY bakiyesi 0 (veya gecersiz) - "
+                      f"kasa.baslangic/kasa.bakiye GUNCELLENMEDI, mevcut/kayitli deger korundu. "
+                      f"[BORSA YANITI] satirini kontrol edin.{RESET}")
         except Exception as e:
             print(f"{RED}  HATA: Canli bakiye cekilemedi, bot baslatilamiyor: {e}{RESET}")
             return
