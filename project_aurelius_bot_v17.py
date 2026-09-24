@@ -389,10 +389,17 @@ v10 farki - BES KRITIK KATMAN (v9'un risk/strateji cekirdegi DEGISTIRILMEDI):
      - CANLI_MOD=False (varsayilan): 5.000 TL sanal kasa ile tam
        simulasyon, v9 ile ayni.
      - CANLI_MOD=True: BINANCE_TR_API_KEY / BINANCE_TR_SECRET_KEY ortam
-       degiskenlerini dogrular, /open-api/v3/account'tan GERCEK serbest
+       degiskenlerini dogrular, /open/v1/account/spot'tan GERCEK serbest
        TRY bakiyesini ceker ve MerkeziKasa ile esitler, evaluate_v9 ve
        acil_tasfiye icindeki her alim/satimda RFC 2104 HMAC-SHA256
-       imzali GERCEK MARKET emrini /open-api/v3/order'a gonderir.
+       imzali GERCEK MARKET emrini /open/v1/orders'a gonderir.
+     - Windows'ta ortam degiskenleri (cmd, TIRNAKSIZ):
+           set BINANCE_TR_API_KEY=anahtariniz
+           set BINANCE_TR_SECRET_KEY=gizli_anahtariniz
+           set AURELIUS_LIVE_CONFIRM=EVET_GERCEK_PARA_KULLAN
+       PowerShell: $env:BINANCE_TR_API_KEY="anahtariniz" (vb.)
+       Degiskenler SADECE o terminal penceresinde gecerlidir; botu ayni
+       pencereden calistirin.
        LOT_SIZE (stepSize) yuvarlamasi ve minNotional kontrolu emirden
        ONCE yapilir; kontrolu gecemeyen ya da borsa tarafindan
        reddedilen emirler ic durumu GUNCELLEMEZ (ic muhasebe ile gercek
@@ -649,6 +656,11 @@ def _ortam_degiskeni_str_oku(isim: str, varsayilan: str = "") -> str:
          sondaki bosluk veya satir sonu karakteri ("API_KEY=abc123\\n" gibi)
          Binance TR'nin "Invalid API-key" hatasina yol acabilir - .strip()
          ile temizlenir.
+      3) Windows cmd'de 'set BINANCE_TR_API_KEY="abc123"' yazildiginda
+         tirnak isaretleri DEGERIN PARCASI olur ('"abc123"') ve borsa
+         anahtari tanimaz (code=3700 Invalid API-key). Anahtarlar, secret,
+         token ve chat id hicbir zaman tirnakla baslayip bitmedigi icin
+         bastaki/sondaki tirnaklar da temizlenir.
     """
     deger = os.getenv(isim, varsayilan)
     if isinstance(deger, (tuple, list)):
@@ -662,7 +674,7 @@ def _ortam_degiskeni_str_oku(isim: str, varsayilan: str = "") -> str:
         )
     if deger is None:
         deger = varsayilan
-    return str(deger).strip()
+    return str(deger).strip().strip("\"'").strip()
 
 
 # v17 FIX - Ortam degiskenlerinden okunan kimlikler. Artik _ortam_degiskeni_str_oku()
@@ -1203,6 +1215,80 @@ def _binance_imzali_sorgu(params: dict) -> str:
     return f"{query}&signature={imza}"
 
 
+def _anahtar_maskele(anahtar: str) -> str:
+    """API key'in sadece ilk/son 4 karakterini gosterir (panelle karsilastirma icin)."""
+    if len(anahtar) <= 12:
+        return "*" * len(anahtar)
+    return f"{anahtar[:4]}...{anahtar[-4:]}"
+
+
+def _supheli_karakter_var(deger: str) -> bool:
+    """Bosluk, tirnak, gorunmez ya da ASCII disi karakter (kopyala-yapistir artigi)."""
+    return any(c.isspace() or c in "\"'`" or not c.isprintable() or ord(c) > 127 for c in deger)
+
+
+def api_anahtari_teshis_raporu() -> None:
+    """
+    CANLI baslangicta borsaya gidecek kimliklerin MASKELI ozetini basar:
+    API key'in ilk/son 4 karakteri + uzunlugu, secret'in SADECE uzunlugu
+    (tek bir karakteri bile yazdirilmaz). Binance TR panelindeki anahtarla
+    karsilastirarak yanlis/eski/eksik kopyalanmis anahtar hemen fark edilir.
+    """
+    print(f"{CYAN}  API KEY    : {_anahtar_maskele(BINANCE_TR_API_KEY)}  "
+          f"({len(BINANCE_TR_API_KEY)} karakter){RESET}")
+    print(f"{CYAN}  SECRET KEY : (gizli)  ({len(BINANCE_TR_SECRET_KEY)} karakter){RESET}")
+    for isim, deger in (("BINANCE_TR_API_KEY", BINANCE_TR_API_KEY),
+                        ("BINANCE_TR_SECRET_KEY", BINANCE_TR_SECRET_KEY)):
+        if _supheli_karakter_var(deger):
+            print(f"{YELLOW}  UYARI: {isim} bosluk/tirnak/gorunmez karakter iceriyor - "
+                  f"kopyalarken fazladan karakter gelmis olabilir.{RESET}")
+    if BINANCE_TR_API_KEY and BINANCE_TR_API_KEY == BINANCE_TR_SECRET_KEY:
+        print(f"{YELLOW}  UYARI: API KEY ile SECRET KEY AYNI - biri yanlis kopyalanmis.{RESET}")
+
+
+def _borsa_hata_ipucu(kod, mesaj) -> None:
+    """
+    Binance TR'nin kimlik dogrulama hatalarinda (code/msg) neyin yanlis
+    oldugunu ve nasil duzeltilecegini Turkce olarak basar. Taninmayan
+    hatalarda hicbir sey yapmaz.
+    """
+    metin = str(mesaj or "").lower()
+    if kod == 3700 or "api-key" in metin:
+        satirlar = [
+            "NEDEN: Binance TR istekteki API anahtarini TANIMADI (imza veya saat hatasi degil -",
+            "       anahtarin KENDISI reddedildi). Kontrol listesi:",
+            " 1) Anahtar Binance TR'de mi olusturuldu (www.binance.tr -> Profil -> API Yonetimi)?",
+            "    Binance Global (binance.com) anahtarlari Binance TR'de GECMEZ.",
+            " 2) Yukarida basilan 'API KEY' ilk/son 4 karakteri ve uzunlugu paneldeki anahtarla ayni mi?",
+            "    Degilse anahtar eksik/yanlis kopyalanmis ya da eski bir deger okunuyor",
+            "    (orn. daha once 'setx' ile kalici kaydedilmis eski anahtar).",
+            " 3) API KEY ile SECRET KEY yer degistirmis olabilir mi?",
+            " 4) Anahtar panelde hala AKTIF mi (silinmis / onayi tamamlanmamis olabilir)?",
+            " 5) Anahtara IP kisitlamasi koyduysaniz, su anki IP adresiniz listede mi?",
+            " 6) Windows cmd'de TIRNAKSIZ ve botla AYNI pencerede tanimlayin:",
+            "      set BINANCE_TR_API_KEY=anahtariniz",
+            "      set BINANCE_TR_SECRET_KEY=gizli_anahtariniz",
+            " Emin degilseniz: panelde YENI bir anahtar olusturup (Okuma + Spot Islem izni)",
+            " iki degeri de yeniden kopyalayin.",
+        ]
+    elif "signature" in metin:
+        satirlar = [
+            "NEDEN: API KEY tanindi ama IMZA gecersiz - SECRET KEY yanlis/eksik kopyalanmis",
+            "       ya da baska bir anahtarin secret'i. Paneldeki anahtarin secret'ini tekrar",
+            "       tanimlayin (secret sadece olusturma aninda gosterilir; kaybettiyseniz",
+            "       yeni anahtar olusturun).",
+        ]
+    elif "timestamp" in metin or "recvwindow" in metin:
+        satirlar = [
+            "NEDEN: Bilgisayarinizin saati borsa saatinden fazla sapmis. Windows: Ayarlar ->",
+            "       Saat ve dil -> Tarih ve saat -> 'Simdi esitle' ve botu yeniden baslatin.",
+        ]
+    else:
+        return
+    for satir in satirlar:
+        print(f"{YELLOW}  {satir}{RESET}")
+
+
 def binance_signed_request(method: str, path: str, params: Optional[dict] = None):
     """
     v17 FIX: CANLI MOD icin RFC 2104 HMAC-SHA256 imzali istek gonderir.
@@ -1253,6 +1339,7 @@ def binance_signed_request(method: str, path: str, params: Optional[dict] = None
               f"HTTP {e.code} -> {ham_govde}{RESET}")
         logger.error("Binance TR imzali istek HTTP hatasi (%s %s): kod=%s ham_govde=%s",
                      method, path, e.code, ham_govde)
+        _borsa_hata_ipucu(None, ham_govde)
         raise
     except Exception as e:
         print(f"{RED}  BINANCE TR IMZALI ISTEK BEKLENMEYEN HATA ({method} {path}): {e}{RESET}")
@@ -1280,6 +1367,7 @@ def _binance_tr_bakiye_listesini_cikar(veri) -> Optional[list]:
         mesaj = veri.get("msg") or veri.get("message") or "(mesaj yok)"
         print(f"{RED}  BINANCE TR HESAP SORGUSU API HATASI DONDURDU: code={kod} msg={mesaj}{RESET}")
         logger.error("Binance TR hesap sorgusu API hatasi: code=%s msg=%s ham_yanit=%r", kod, mesaj, veri)
+        _borsa_hata_ipucu(kod, mesaj)
         return None
 
     data = veri.get("data")
@@ -1521,8 +1609,10 @@ def canli_mod_on_kontrol() -> bool:
         print(f"{RED}  HATA: CANLI_MOD=True ama BINANCE_TR_API_KEY / BINANCE_TR_SECRET_KEY "
               f"ortam degiskenleri tanimli degil.{RESET}")
         hata_var = True
+    else:
+        api_anahtari_teshis_raporu()
 
-    if os.getenv("AURELIUS_LIVE_CONFIRM", "") != "EVET_GERCEK_PARA_KULLAN":
+    if _ortam_degiskeni_str_oku("AURELIUS_LIVE_CONFIRM") != "EVET_GERCEK_PARA_KULLAN":
         print(f"{RED}  HATA: CANLI_MOD=True icin ek bir guvenlik onayi gerekiyor.{RESET}")
         print(f"{RED}  Ortam degiskeni olarak AURELIUS_LIVE_CONFIRM=EVET_GERCEK_PARA_KULLAN "
               f"tanimlamadan bot GERCEK PARA ile baslamaz. Bu, kod icindeki tek bir "

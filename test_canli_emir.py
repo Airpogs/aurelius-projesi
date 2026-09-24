@@ -32,6 +32,12 @@ Kullanim (kendi ortaminizda, gercek anahtarlarinizla):
     export BINANCE_TR_SECRET_KEY="..."
     export AURELIUS_LIVE_CONFIRM="EVET_GERCEK_PARA_KULLAN"
     python3 test_canli_emir.py PEPETRY
+
+Windows cmd (TIRNAKSIZ - tirnaklar degerin parcasi olur; ayni pencerede calistirin):
+    set BINANCE_TR_API_KEY=anahtariniz
+    set BINANCE_TR_SECRET_KEY=gizli_anahtariniz
+    set AURELIUS_LIVE_CONFIRM=EVET_GERCEK_PARA_KULLAN
+    python test_canli_emir.py PEPETRY
 """
 import importlib.util
 import os
