@@ -2,6 +2,37 @@
 PROJECT AURELIUS - v17
 Binance TR AKILLI SECIM Grid Trading Bot - PIYASA ADAPTIF MOTOR VE OTONOM SERMAYE DONGUSU
 ======================================================================
+v17 FIX-2 - TAM KOD INCELEMESI DUZELTMELERI:
+  CANLI EMIR GUVENLIGI
+  - Emir (POST) istekleri artik otomatik tekrar denenmiyor (zaman asimi/
+    5xx sonrasi tekrar, ayni emri iki kez gonderebiliyordu).
+  - HTTP 200 + code!=0 donen (reddedilen) emirler artik basari sayilmiyor.
+  - /open/v1 emir sembolu 'PEPETRY' -> 'PEPE_TRY' bicimine cevriliyor.
+  - SATIS miktari borsadaki gercek serbest bakiyeyle sinirlaniyor (alim
+    komisyonu coinden kesildigi icin tam miktar reddediliyor, stop-loss
+    mutabakata kadar calismiyordu); tam kapanista satilamayan toz yazilip
+    pozisyon kapatiliyor.
+  SAHTE ACIL FREN RISKLERI
+  - Okunamayan bakiye yaniti artik 0 TRY sayilmiyor (mutabakat kasayi
+    sifirlayip tum pozisyonlari tasfiye ettirebiliyordu).
+  - Fiyati alinamayan pozisyon 0 TL yerine giris fiyatindan degerleniyor.
+  DURUM/KASA
+  - Durum dosyasi calisma_modu ile etiketleniyor; SIMULASYON durumu CANLI
+    modda yuklenmiyor (yedeklenir). Canli bakiye 0 ise sanal 5.000 TL ile
+    emir denenmiyor.
+  - Mutabakat tek hesap sorgusu yapiyor, sadece ASAGI senkronize ediyor
+    (bot disi coinleri sahiplenmez) ve borsada artik olmayan pozisyonu
+    kapatiyor; acik pozisyon sayaci her tick yeniden hesaplaniyor.
+  DIGER
+  - Grid, pozisyon yokken fiyat banttan cikinca yeniden ortalaniyor (aksi
+    halde coin izleme listesinde kaldikca bir daha alinamiyordu).
+  - Kritik Telegram uyarilari: istisna metni HTML-kacirilir, cikista kuyruk
+    bosaltilir (ACIL FREN / KRITIK HATA mesajlari kayboluyordu).
+  - Reddedilen kismi kar alma her tick tekrar denenmiyor; ZAMAN-ASIMI satisi
+    basarisizsa stop-loss kontrolu atlanmiyor; coin adi 'TRY' sonekiyle
+    dogru ayriliyor.
+
+======================================================================
 v17 FIX - BINANCE TR CANLI MOD API ENTEGRASYON DUZELTMESI (bakiye hep
 0.00 TRY donuyordu / "Invalid API-key" / "tuple object has no attribute
 'encode'"):
@@ -409,6 +440,7 @@ Kullanim:
 
 import time
 import random
+import html
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -504,7 +536,6 @@ KLINE_LIMIT_TREND = 60
 # RSI giris filtresi ayarlari - DEGISTIRILMEDI
 RSI_PERIYOT = 14
 RSI_ASIRI_ALIM_ESIGI = 60
-RSI_GIRIS_UST_ESIGI = 50
 RSI_BEKLEME_KONTROL_ARALIGI_TUR = 2
 
 # CSV kayit dosyalari + v10 STATE dosyasi - script ile ayni klasore yazilir
@@ -580,6 +611,22 @@ RECV_WINDOW_MS = 5000
 # bu kodlara cevirir.
 ORDER_SIDE_KODU = {"BUY": "0", "SELL": "1"}
 ORDER_TIPI_MARKET_KODU = "2"
+
+
+def _coin_adi(symbol: str) -> str:
+    """'PEPETRY' -> 'PEPE'. str.replace("TRY", "") adinda TRY gecen
+    varliklari bozar (orn. 'SENTRYTRY' -> 'SEN'); sadece sondaki TRY atilir."""
+    return symbol[:-3] if symbol.endswith("TRY") else symbol
+
+
+def binance_tr_islem_sembolu(symbol: str) -> str:
+    """Genel piyasa verisi (api/v3) 'PEPETRY' bicimini kullanir; Binance TR'nin
+    ozel /open/v1 uc noktalari ise 'PEPE_TRY' bicimini bekler (bkz.
+    ORDER_ENDPOINT_PATH KAYNAK NOTU - ayni kutuphanenin README ornegi:
+    postNewLimitOrder("USDT_TRY", ...))."""
+    if "_" in symbol or not symbol.endswith("TRY"):
+        return symbol
+    return f"{symbol[:-3]}_TRY"
 
 # v10 - Tahta derinligi / spread filtresi
 ORDERBOOK_DEPTH_LIMIT = 5
@@ -862,12 +909,13 @@ def http_istek_yap(req: urllib.request.Request, timeout: float = 15, max_deneme:
     gecikme = BACKOFF_BASLANGIC_SANIYE
     son_hata = None
     for deneme in range(1, max_deneme + 1):
+        son_deneme = deneme >= max_deneme
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
             son_hata = e
-            if e.code == 429 or e.code >= 500:
+            if (e.code == 429 or e.code >= 500) and not son_deneme:
                 print(f"{YELLOW}  HTTP {e.code} alindi ({deneme}/{max_deneme}), "
                       f"{gecikme:.1f}sn sonra tekrar denenecek...{RESET}")
                 time.sleep(gecikme)
@@ -876,6 +924,8 @@ def http_istek_yap(req: urllib.request.Request, timeout: float = 15, max_deneme:
             raise
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             son_hata = e
+            if son_deneme:
+                break
             print(f"{YELLOW}  Ag hatasi ({e}) ({deneme}/{max_deneme}), "
                   f"{gecikme:.1f}sn sonra tekrar denenecek...{RESET}")
             time.sleep(gecikme)
@@ -954,6 +1004,20 @@ def _telegram_worker() -> None:
             _telegram_kuyrugu.task_done()
 
 
+def telegram_kuyrugunu_bosalt(zaman_asimi_saniye: float = 20.0) -> None:
+    """Worker thread daemon oldugu icin program kapaninca kuyruktaki mesajlar
+    atilir; ACIL FREN / KRITIK HATA / Ctrl+C uyarilari tam da cikistan hemen
+    once kuyruga eklenir. Cikmadan once kuyrugun bosalmasini (en fazla
+    zaman_asimi_saniye) bekler."""
+    if not _telegram_thread_baslatildi:
+        return
+    bitis = time.time() + zaman_asimi_saniye
+    while _telegram_kuyrugu.unfinished_tasks and time.time() < bitis:
+        time.sleep(0.2)
+    if _telegram_kuyrugu.unfinished_tasks:
+        logger.warning("Cikista %d Telegram mesaji gonderilemeden kaldi.", _telegram_kuyrugu.unfinished_tasks)
+
+
 def _telegram_worker_baslat() -> None:
     global _telegram_thread_baslatildi
     with _telegram_thread_lock:
@@ -978,6 +1042,7 @@ def durumu_kaydet(kasa: "MerkeziKasa", pozisyonlar: dict, rapor: "RaporlamaDurum
     """
     try:
         veri = {
+            "calisma_modu": _aktif_calisma_modu(),
             "kasa_bakiye": kasa.bakiye,
             "kasa_baslangic": kasa.baslangic,
             "kasa_toplam_komisyon": kasa.toplam_komisyon,
@@ -1025,17 +1090,43 @@ def durumu_kaydet(kasa: "MerkeziKasa", pozisyonlar: dict, rapor: "RaporlamaDurum
         print(f"{RED}  (Durum kaydedilemedi: {e}){RESET}")
 
 
+def _aktif_calisma_modu() -> str:
+    return "CANLI" if CANLI_MOD else "SIMULASYON"
+
+
 def durumu_yukle() -> Optional[dict]:
     """v10: STATE_DOSYASI varsa okur ve dondurur. Yoksa veya bozuksa
-    None doner (bu durumda temiz baslangic yapilir)."""
+    None doner (bu durumda temiz baslangic yapilir).
+
+    v17 FIX: Dosya baska bir calisma modunda kaydedilmisse (orn. SIMULASYON
+    durumu varken CANLI_MOD=True ile baslatildi) YUKLENMEZ: aksi halde sanal
+    pozisyonlar ve sanal kasa GERCEK para ile islem yapan bota tasinir ve bot
+    sahip olmadigi coinleri satmaya calisir. Eski dosya silinmez, yedeklenir.
+    "calisma_modu" alani olmayan eski dosyalar SIMULASYON kabul edilir (onceki
+    surumlerde canli mod hic basarili emir gonderemiyordu)."""
     if not os.path.exists(STATE_DOSYASI):
         return None
     try:
         with open(STATE_DOSYASI, "r", encoding="utf-8") as f:
-            return json.load(f)
+            veri = json.load(f)
     except Exception as e:
         print(f"{RED}  (Durum dosyasi okunamadi, temiz baslangic yapilacak: {e}){RESET}")
         return None
+
+    kayitli_mod = veri.get("calisma_modu", "SIMULASYON")
+    aktif_mod = _aktif_calisma_modu()
+    if kayitli_mod != aktif_mod:
+        yedek = f"{STATE_DOSYASI}.{kayitli_mod.lower()}.yedek"
+        try:
+            os.replace(STATE_DOSYASI, yedek)
+            yedek_notu = f"eski dosya '{os.path.basename(yedek)}' olarak yedeklendi"
+        except OSError as e:
+            yedek_notu = f"yedeklenemedi ({e}) - ilk kayitta uzerine yazilacak"
+        print(f"{YELLOW}  Durum dosyasi {kayitli_mod} modunda kaydedilmis; {aktif_mod} modunda "
+              f"KULLANILMIYOR, temiz baslangic yapiliyor ({yedek_notu}).{RESET}")
+        logger.warning("Durum dosyasi modu uyusmuyor (%s != %s): %s", kayitli_mod, aktif_mod, yedek_notu)
+        return None
+    return veri
 
 
 def durumdan_kasa_ve_pozisyonlar_olustur(veri: dict):
@@ -1049,7 +1140,7 @@ def durumdan_kasa_ve_pozisyonlar_olustur(veri: dict):
     for sym, p in veri.get("pozisyonlar", {}).items():
         b = CoinBot(
             symbol=sym,
-            coin_name=p.get("coin_name", sym.replace("TRY", "")),
+            coin_name=p.get("coin_name", _coin_adi(sym)),
             width_pct=p.get("width_pct", VARSAYILAN_WIDTH_PCT),
             grid_count=p.get("grid_count", VARSAYILAN_GRID_SAYISI),
             starting_try=p.get("starting_try", 0.0),
@@ -1148,7 +1239,10 @@ def binance_signed_request(method: str, path: str, params: Optional[dict] = None
             url = f"{BINANCE_TR_PRIVATE_BASE_URL}{path}"
             req = urllib.request.Request(url, data=query_signed.encode("utf-8"), headers=headers, method=method)
 
-        return http_istek_yap(req, timeout=15)
+        # Emir (POST) istekleri idempotent degildir: zaman asimi/5xx sonrasi
+        # otomatik tekrar, borsaya ulasmis bir emri IKINCI kez gonderebilir.
+        max_deneme = BACKOFF_MAX_DENEME if method == "GET" else 1
+        return http_istek_yap(req, timeout=15, max_deneme=max_deneme)
 
     except urllib.error.HTTPError as e:
         try:
@@ -1166,32 +1260,27 @@ def binance_signed_request(method: str, path: str, params: Optional[dict] = None
         raise
 
 
-def _binance_tr_bakiye_listesini_cikar(veri) -> list:
+def _binance_tr_bakiye_listesini_cikar(veri) -> Optional[list]:
     """
     v17 FIX: Binance TR'nin /open/v1/account/spot yaniti Binance Global'den
     FARKLI bir "zarf" (envelope) kullanir - bakiye listesi yanitin KOK
     dizininde DEGIL, "data" sozlugu altinda gelir:
         {"code": 0, "data": {"balances": [...]}}   VEYA
         {"code": 0, "data": {"assets":   [...]}}
-    Eski kod dogrudan veri.get("balances", []) aradigi icin liste HER ZAMAN
-    bos donuyor ve cuzdanda serbest TRY olsa bile bakiye SESSIZCE 0.00 TRY
-    basiliyordu. Bu fonksiyon HER IKI bilinen sekli de destekler; ayrica:
-      - "code" alani 0'dan FARKLIYSA (API seviyesinde hata donmus demektir,
-        orn. yetkisiz istek) HAM YANITI loglar ve bos liste dondurur.
-      - Beklenmeyen/tanimadigi bir format gelirse (borsa API'sini
-        degistirmis olabilir) HAM YANITI loglar ve bos liste dondurur -
-        boylece sorun "hep 0.00 TRY" yerine log dosyasinda GORUNUR olur.
+    "code" 0'dan farkliysa (API hatasi) veya format taninmiyorsa ham yaniti
+    loglar ve None dondurur. None, "bakiye 0" ile KARISTIRILMAMALIDIR:
+    cagiran taraf okunamayan bir yaniti asla sifir bakiye gibi kullanmamali.
     """
     if not isinstance(veri, dict):
         logger.error("Binance TR hesap yaniti beklenmeyen tip (%s): %r", type(veri).__name__, veri)
-        return []
+        return None
 
     kod = veri.get("code")
     if kod not in (0, None):
         mesaj = veri.get("msg") or veri.get("message") or "(mesaj yok)"
         print(f"{RED}  BINANCE TR HESAP SORGUSU API HATASI DONDURDU: code={kod} msg={mesaj}{RESET}")
         logger.error("Binance TR hesap sorgusu API hatasi: code=%s msg=%s ham_yanit=%r", kod, mesaj, veri)
-        return []
+        return None
 
     data = veri.get("data")
     if isinstance(data, dict):
@@ -1207,43 +1296,61 @@ def _binance_tr_bakiye_listesini_cikar(veri) -> list:
 
     print(f"{RED}  BINANCE TR HESAP YANITI BEKLENMEYEN FORMATTA - ham yanit log dosyasina yazildi.{RESET}")
     logger.error("Binance TR hesap yanitinda 'data.balances'/'data.assets' bulunamadi - ham yanit: %r", veri)
-    return []
+    return None
+
+
+def binance_hesap_bakiyeleri() -> dict:
+    """
+    /open/v1/account/spot yanitini {varlik: {"free": float, "locked": float}}
+    sozlugune cevirir. Ham yaniti [BORSA YANITI] onekiyle terminale basar.
+    Yanit okunamazsa (API hatasi, beklenmeyen format, sayiya cevrilemeyen
+    miktar) RuntimeError FIRLATIR - asla sessizce bos/sifir dondurmez.
+    Alan adi icin "asset" yoksa "coin"/"currency"; miktar icin "free" yoksa
+    "available", kilitli icin "locked" yoksa "frozen" denenir.
+    """
+    veri = binance_signed_request("GET", ACCOUNT_ENDPOINT_PATH)
+    print(f"{GRAY}[BORSA YANITI]: {veri!r}{RESET}")
+    liste = _binance_tr_bakiye_listesini_cikar(veri)
+    if liste is None:
+        raise RuntimeError("Binance TR hesap yaniti okunamadi (API hatasi veya beklenmeyen format) "
+                           "- [BORSA YANITI] satirina bakin.")
+
+    bakiyeler = {}
+    for kayit in liste:
+        if not isinstance(kayit, dict):
+            continue
+        varlik = kayit.get("asset") or kayit.get("coin") or kayit.get("currency")
+        if not varlik:
+            continue
+        serbest = kayit.get("free")
+        if serbest is None:
+            serbest = kayit.get("available")
+        kilitli = kayit.get("locked")
+        if kilitli is None:
+            kilitli = kayit.get("frozen")
+        try:
+            bakiyeler[varlik] = {"free": float(serbest or 0), "locked": float(kilitli or 0)}
+        except (TypeError, ValueError):
+            logger.error("Binance TR bakiye kaydi sayiya cevrilemedi, ham kayit: %r", kayit)
+            raise RuntimeError(f"Binance TR {varlik} bakiyesi sayiya cevrilemedi: {kayit!r}")
+    return bakiyeler
 
 
 def binance_serbest_try_bakiyesi() -> float:
     """
     v17 FIX: /open/v1/account/spot uzerinden GERCEK serbest TRY bakiyesini
-    ceker. Bakiye listesi artik _binance_tr_bakiye_listesini_cikar() ile,
-    Binance TR'nin gercek "data.balances"/"data.assets" zarfina uygun
-    sekilde okunuyor (eskiden kok dizinde aranip HEP bos donuyordu, bu
-    yuzden TRY bakiyesi cuzdanda para olsa bile hep 0.00 TRY basiliyordu).
-    Alan adi olarak once "asset" (Binance-stili), yoksa "coin"/"currency"
-    denenir; miktar icin once "free", yoksa "available" denenir - borsanin
-    tam alan adlandirmasi teyit edilene kadar esneklik icin.
+    ceker ("data.balances"/"data.assets" zarfi - bkz. binance_hesap_
+    bakiyeleri). Yanit okunamazsa RuntimeError firlatir; boylece bir API
+    hatasi "0.00 TRY" gibi gorunup kasayi sifirlamaz (mutabakat sonrasi
+    sahte ACIL FREN tetiklemesine yol acabiliyordu). Yanit gecerli ama TRY
+    kaydi yoksa gercekten 0 kabul edilir.
     """
-    veri = binance_signed_request("GET", ACCOUNT_ENDPOINT_PATH)
-    # v17 FIX: ham borsa yanitini HER ZAMAN terminale bas - olasi API hata
-    # kodlarini (orn. code=-2015 Invalid API-key) gozle GORMEK icin. Bu,
-    # logger.error ile 'project_aurelius.log' dosyasina yazilan kayda EKtir,
-    # onun yerine gecmez.
-    print(f"{GRAY}[BORSA YANITI]: {veri!r}{RESET}")
-    for bakiye in _binance_tr_bakiye_listesini_cikar(veri):
-        if not isinstance(bakiye, dict):
-            continue
-        asset_adi = bakiye.get("asset") or bakiye.get("coin") or bakiye.get("currency")
-        if asset_adi != "TRY":
-            continue
-        serbest = bakiye.get("free")
-        if serbest is None:
-            serbest = bakiye.get("available", 0.0)
-        try:
-            return float(serbest)
-        except (TypeError, ValueError):
-            logger.error("Binance TR TRY bakiyesi sayiya cevrilemedi, ham kayit: %r", bakiye)
-            return 0.0
-
-    logger.warning("Binance TR hesap yanitinda TRY varligi bulunamadi - ham yanit: %r", veri)
-    return 0.0
+    bakiyeler = binance_hesap_bakiyeleri()
+    try_kaydi = bakiyeler.get("TRY")
+    if try_kaydi is None:
+        logger.warning("Binance TR hesap yanitinda TRY varligi bulunamadi - 0 kabul edildi.")
+        return 0.0
+    return try_kaydi["free"]
 
 
 def mutabakat_yap(kasa: "MerkeziKasa", pozisyonlar: dict) -> None:
@@ -1260,45 +1367,58 @@ def mutabakat_yap(kasa: "MerkeziKasa", pozisyonlar: dict) -> None:
     if not CANLI_MOD:
         return
     try:
-        gercek_bakiye = binance_serbest_try_bakiyesi()
-        eski_bakiye = kasa.bakiye
-        fark = gercek_bakiye - eski_bakiye
-        kasa.bakiye = gercek_bakiye
-        if abs(fark) > 0.01:
-            print(f"{CYAN}  MUTABAKAT: Kasa bakiyesi borsa ile senkronize edildi "
-                  f"({eski_bakiye:,.2f} -> {gercek_bakiye:,.2f} TRY, fark: {fark:+,.2f}){RESET}")
-            logger.warning("Mutabakat: kasa bakiyesi %.2f -> %.2f (fark %.2f)", eski_bakiye, gercek_bakiye, fark)
-
-        hesap = binance_signed_request("GET", ACCOUNT_ENDPOINT_PATH)
-        print(f"{GRAY}[BORSA YANITI]: {hesap!r}{RESET}")  # v17 FIX: ham yaniti gozle gor
-        # v17 FIX: ayni "data.balances"/"data.assets" zarfi burada da
-        # kullaniliyor - eskiden hesap.get("balances", []) hep bos donup
-        # coin miktari mutabakati SESSIZCE hicbir sey yapmiyordu.
-        borsa_bakiyeleri = {
-            (b.get("asset") or b.get("coin") or b.get("currency")):
-                float(b.get("free") or b.get("available") or 0) + float(b.get("locked") or b.get("frozen") or 0)
-            for b in _binance_tr_bakiye_listesini_cikar(hesap)
-            if isinstance(b, dict)
-        }
-        for bot in pozisyonlar.values():
-            if not bot.has_open_position:
-                continue
-            gercek_miktar = borsa_bakiyeleri.get(bot.coin_name)
-            if gercek_miktar is None:
-                continue
-            fark_miktar = abs(gercek_miktar - bot.coin_qty)
-            esik = max(1e-8, bot.coin_qty * 0.001)  # binde 1'den fazla sapma varsa senkronize et
-            if fark_miktar > esik:
-                print(f"{CYAN}  MUTABAKAT: {bot.symbol} miktari senkronize edildi "
-                      f"({bot.coin_qty:.8f} -> {gercek_miktar:.8f}){RESET}")
-                logger.warning("Mutabakat: %s miktari %.8f -> %.8f", bot.symbol, bot.coin_qty, gercek_miktar)
-                bot.coin_qty = gercek_miktar
-                acik_seviye = next((lvl for lvl in bot.grid if lvl.has_position), None)
-                if acik_seviye:
-                    acik_seviye.buy_qty = gercek_miktar
+        bakiyeler = binance_hesap_bakiyeleri()
     except Exception as e:
-        print(f"{RED}  MUTABAKAT basarisiz (bir sonraki denemede tekrar denenecek): {e}{RESET}")
+        # Okunamayan bir yanit ASLA kasayi sifirlamamali: kasa.bakiye=0 olursa
+        # portfoy degeri duser ve ACIL FREN tum pozisyonlari tasfiye edebilir.
+        print(f"{RED}  MUTABAKAT basarisiz, kasa DEGISTIRILMEDI (bir sonraki denemede "
+              f"tekrar denenecek): {e}{RESET}")
         logger.error("Mutabakat basarisiz: %s", e)
+        return
+
+    gercek_bakiye = bakiyeler.get("TRY", {}).get("free", 0.0)
+    eski_bakiye = kasa.bakiye
+    fark = gercek_bakiye - eski_bakiye
+    kasa.bakiye = gercek_bakiye
+    if abs(fark) > 0.01:
+        print(f"{CYAN}  MUTABAKAT: Kasa bakiyesi borsa ile senkronize edildi "
+              f"({eski_bakiye:,.2f} -> {gercek_bakiye:,.2f} TRY, fark: {fark:+,.2f}){RESET}")
+        logger.warning("Mutabakat: kasa bakiyesi %.2f -> %.2f (fark %.2f)", eski_bakiye, gercek_bakiye, fark)
+
+    for bot in pozisyonlar.values():
+        if not bot.has_open_position:
+            continue
+        kayit = bakiyeler.get(bot.coin_name)
+        if kayit is None:
+            continue
+        gercek_miktar = kayit["free"] + kayit["locked"]
+        acik_seviye = next((lvl for lvl in bot.grid if lvl.has_position), None)
+
+        if gercek_miktar <= bot.coin_qty * 0.01:
+            # Borsada pozisyon fiilen yok (orn. elle satilmis): ic kaydi kapat,
+            # yoksa bot var olmayan coini her tick satmaya calisir ve slot
+            # sonsuza kadar dolu kalir.
+            print(f"{YELLOW}  MUTABAKAT: {bot.symbol} borsada artik yok "
+                  f"({bot.coin_qty:.8f} -> {gercek_miktar:.8f}) - ic pozisyon kapatildi.{RESET}")
+            logger.warning("Mutabakat: %s borsada yok, ic pozisyon kapatildi (%.8f -> %.8f)",
+                           bot.symbol, bot.coin_qty, gercek_miktar)
+            bot.coin_qty = 0.0
+            bot.alis_zamani = None
+            if acik_seviye:
+                acik_seviye.has_position = False
+                acik_seviye.buy_qty = 0.0
+            continue
+
+        # Sadece ASAGI senkronize et: borsadaki fazlalik kullanicinin bot
+        # disi varligi olabilir; bot, kendi almadigi coini asla satmamali.
+        esik = max(1e-8, bot.coin_qty * 0.001)  # binde 1'den fazla eksik varsa senkronize et
+        if bot.coin_qty - gercek_miktar > esik:
+            print(f"{CYAN}  MUTABAKAT: {bot.symbol} miktari senkronize edildi "
+                  f"({bot.coin_qty:.8f} -> {gercek_miktar:.8f}){RESET}")
+            logger.warning("Mutabakat: %s miktari %.8f -> %.8f", bot.symbol, bot.coin_qty, gercek_miktar)
+            bot.coin_qty = gercek_miktar
+            if acik_seviye:
+                acik_seviye.buy_qty = gercek_miktar
 
 
 _sembol_filtre_onbellek: dict = {}
@@ -1361,13 +1481,19 @@ def binance_gercek_emir_gonder(symbol: str, side: str, quantity: float) -> dict:
     arayuzunuzdeki islem gecmisiyle MUTLAKA karsilastirin).
     """
     params = {
-        "symbol": symbol,
+        "symbol": binance_tr_islem_sembolu(symbol),
         "side": ORDER_SIDE_KODU.get(side, side),
         "type": ORDER_TIPI_MARKET_KODU,
         "quantity": f"{quantity:.8f}".rstrip("0").rstrip("."),
     }
     sonuc = binance_signed_request("POST", ORDER_ENDPOINT_PATH, params)
     print(f"{GRAY}[BORSA YANITI]: {sonuc!r}{RESET}")
+    # Binance TR reddedilen emirleri de HTTP 200 + {"code": <sifirdan farkli>}
+    # ile dondurebilir; bunu basari sayarsak ic muhasebe var olmayan bir
+    # pozisyon/satis kaydeder.
+    if isinstance(sonuc, dict) and sonuc.get("code") not in (0, None):
+        mesaj = sonuc.get("msg") or sonuc.get("message") or "(mesaj yok)"
+        raise RuntimeError(f"Binance TR emri reddetti: code={sonuc.get('code')} msg={mesaj}")
     return sonuc
 
 
@@ -1652,6 +1778,17 @@ class CoinBot:
     def has_open_position(self) -> bool:
         return self.coin_qty > 1e-12
 
+    def guncel_fiyat(self) -> float:
+        """Bilinen son fiyat; hic fiyat alinamamissa (yeniden baslatma sonrasi
+        ilk tick veya fiyat sorgusu hatasi) acik pozisyonun giris fiyati.
+        0 dondurmek pozisyonu sifir degerde gosterir ve sahte bir ACIL FREN
+        tasfiyesini tetikleyebilir."""
+        fiyat = self.last_real_price or self.last_sim_price
+        if fiyat:
+            return fiyat
+        acik_seviye = next((lvl for lvl in self.grid if lvl.has_position), None)
+        return acik_seviye.buy_price if acik_seviye else 0.0
+
     def cooldown_aktif_mi(self) -> bool:
         if self.son_satis_zamani is None:
             return False
@@ -1732,6 +1869,21 @@ class CoinBot:
             print(f"{RED}  CANLI EMIR IPTAL: sembol filtreleri alinamadi ({self.symbol}): {e}{RESET}")
             return None
 
+        if side == "SELL":
+            # Borsa ALIM komisyonunu alinan coinden keser (BNB ile odenmiyorsa);
+            # ic kayit komisyon oncesi miktari tuttugu icin tam miktarla satis
+            # "yetersiz bakiye" ile reddedilir ve stop-loss mutabakata kadar
+            # (6 saate kadar) hic calismaz. Satisi gercek serbest bakiyeyle sinirla.
+            try:
+                serbest = binance_hesap_bakiyeleri().get(self.coin_name, {}).get("free")
+                if serbest is not None and serbest < qty:
+                    print(f"{YELLOW}  CANLI SATIS: {self.symbol} miktari borsadaki serbest bakiyeye "
+                          f"cekildi ({qty:.8f} -> {serbest:.8f}).{RESET}")
+                    qty = serbest
+            except Exception as e:
+                print(f"{YELLOW}  CANLI SATIS: {self.coin_name} serbest bakiyesi okunamadi ({e}) - "
+                      f"ic kayittaki miktarla deneniyor.{RESET}")
+
         yuvarlanmis_qty = miktari_lot_size_yuvarla(qty, filtreler.get("step_size"))
         if yuvarlanmis_qty <= 0:
             print(f"{RED}  CANLI EMIR IPTAL: LOT_SIZE yuvarlamasi sonrasi miktar 0 ({self.symbol}).{RESET}")
@@ -1750,7 +1902,10 @@ class CoinBot:
             return yuvarlanmis_qty
         except Exception as e:
             print(f"{RED}  CANLI EMIR BASARISIZ ({side} {self.symbol}): {e}{RESET}")
-            send_telegram(f"\u26a0\ufe0f <b>CANLI EMIR BASARISIZ</b>\n{self.symbol} {side} - {e}")
+            # Istisna metni '<urlopen error ...>' gibi '<' icerebilir; kacirilmazsa
+            # Telegram HTML ayristirmasi 400 dondurur ve bu kritik uyari hic gitmez.
+            send_telegram(f"\u26a0\ufe0f <b>CANLI EMIR BASARISIZ</b>\n{self.symbol} {side} - "
+                          f"{html.escape(str(e))}")
             return None
 
     def _ratchet_stop_hesapla(self, level: "GridLevel") -> tuple:
@@ -1832,6 +1987,8 @@ class CoinBot:
         Basarili olursa True, CANLI_MOD'da gercek emir basarisiz olursa
         False doner (bu durumda HICBIR ic durum degismez).
         """
+        tam_kapanis_niyeti = miktar is None
+        onceki_level_qty = level.buy_qty
         sell_qty = level.buy_qty if miktar is None else miktar
         if sell_qty <= 0:
             return False
@@ -1843,23 +2000,30 @@ class CoinBot:
                 return False  # gercek emir gitmedi - ic durum degismez, sonraki tick'te tekrar denenir
             sell_qty = dogrulanmis_qty
 
+        # CANLI modda tam kapanista satilan miktar LOT_SIZE yuvarlamasi /
+        # komisyon kesintisi yuzunden ic kayittan biraz az olabilir. Kalan
+        # satilamaz "toz" pozisyonu acik tutarsa bot her tick 0 miktarla satmaya
+        # calisir ve slot bosalmaz; tozun maliyeti zarar olarak yazilip seviye kapatilir.
+        maliyet_qty = onceki_level_qty if tam_kapanis_niyeti else sell_qty
         brut_proceeds = sell_qty * exec_price
         komisyon = brut_proceeds * KOMISYON_PCT
         net_proceeds = brut_proceeds - komisyon
-        cost = sell_qty * level.buy_price
+        cost = maliyet_qty * level.buy_price
         islem_net_pnl = net_proceeds - cost  # v17 MODUL 4: SADECE bu islemden elde edilen net K/Z
         islem_net_pnl_pct = (islem_net_pnl / cost * 100) if cost else 0.0
 
         self.cash_try += net_proceeds
-        self.coin_qty = max(0.0, self.coin_qty - sell_qty)
+        self.coin_qty = max(0.0, self.coin_qty - maliyet_qty)
         self.toplam_komisyon += komisyon
         self.realized_pnl += net_proceeds - cost
-        level.buy_qty = max(0.0, level.buy_qty - sell_qty)
+        level.buy_qty = 0.0 if tam_kapanis_niyeti else max(0.0, level.buy_qty - sell_qty)
 
-        tam_kapanis = level.buy_qty <= 1e-9
+        tam_kapanis = tam_kapanis_niyeti or level.buy_qty <= 1e-9
         if tam_kapanis:
             level.has_position = False
             level.buy_qty = 0.0
+            if not any(lvl.has_position for lvl in self.grid):
+                self.coin_qty = 0.0  # kayan nokta artigi has_open_position'i True birakmasin
             self.alis_zamani = None  # v16
             if kasa is not None:
                 kasa.yatir(net_proceeds, komisyon)
@@ -1915,8 +2079,14 @@ class CoinBot:
                     and price >= level.buy_price * (1 + KISMI_KAR_AL_PCT)):
                 kismi_qty = level.buy_qty * KISMI_KAR_AL_ORANI
                 if kismi_qty > 0:
-                    self._satisi_uygula(level, price, "KISMI-KAR-AL", sim, kasa,
-                                         acik_pozisyon_sayaci, rapor, durum_kaydet, miktar=kismi_qty)
+                    basarili = self._satisi_uygula(level, price, "KISMI-KAR-AL", sim, kasa,
+                                                   acik_pozisyon_sayaci, rapor, durum_kaydet, miktar=kismi_qty)
+                    if not basarili:
+                        # Kismi satis reddedildiyse (orn. yarim pozisyon minNotional
+                        # altinda) her tick tekrar denenmesin; tam cikislar etkilenmez.
+                        level.kismi_kar_alindi = True
+                        print(f"[{ts()}] {YELLOW}{self.symbol} kismi kar alma gerceklestirilemedi - "
+                              f"atlandi, pozisyon tam cikis kurallariyla yonetilmeye devam ediyor.{RESET}")
 
             if not level.has_position:
                 continue  # kismi kar alma pozisyonu tam kapatmis olamaz, ama guvenlik icin kontrol
@@ -1938,7 +2108,9 @@ class CoinBot:
                               f"{MAKS_POZISYON_OMRU_SAAT:.0f} saattir yatay seyrettigi icin "
                               f"sermaye serbest birakildi.{RESET}")
                         send_telegram(mesaj)
-                    continue  # bu seviye kapandi (veya emir basarisiz oldu) - ratchet kontrolu gereksiz
+                        continue
+                    # Zaman asimi satisi basarisizsa asagidaki stop-loss kontrolu
+                    # yine calismali; aksi halde stop her tick atlanir.
 
             # v12/v14: UC KADEMELI RATCHET STOP SISTEMI - artik ortak
             # _ratchet_stop_hesapla() metodundan hesaplanir (raporlama/
@@ -2536,7 +2708,8 @@ def print_banner():
     print(f"{GRAY}  Komisyon           : %{KOMISYON_PCT * 100:.2f}{RESET}")
     print(f"{GRAY}  Slipaj araligi     : %{SLIPAJ_MIN_PCT * 100:.2f} - %{SLIPAJ_MAKS_PCT * 100:.2f}{RESET}")
     print(f"{GRAY}  Trend filtresi     : EMA{EMA_PERIYOT}, esik %{TREND_ESIK_PCT * 100:.1f}{RESET}")
-    print(f"{GRAY}  RSI giris filtresi : asiri alim>={RSI_ASIRI_ALIM_ESIGI}, giris esigi<={RSI_GIRIS_UST_ESIGI}{RESET}")
+    print(f"{GRAY}  RSI giris filtresi : asiri alim>={RSI_ASIRI_ALIM_ESIGI} beklemeye alinir, "
+          f"giris icin RSI {RSI_KALITE_ALT_ESIK}-{RSI_KALITE_UST_ESIK}{RESET}")
     print(f"{GRAY}  Sabit stop-loss    : %{STOP_LOSS_PCT * 100:.0f} (taban){RESET}")
     print(f"{GRAY}  Basa-bas aktivasyon: %{BREAKEVEN_AKTIVASYON_PCT * 100:.1f} kardan sonra stop=basabas{RESET}")
     print(f"{GRAY}  Trailing aktivasyon: %{TRAILING_AKTIVASYON_PCT * 100:.1f} kardan sonra devreye girer{RESET}")
@@ -2687,8 +2860,7 @@ def v9_toplam_portfoy_degeri(kasa: MerkeziKasa, pozisyonlar: dict) -> float:
     toplam = kasa.bakiye
     for bot in pozisyonlar.values():
         if bot.has_open_position:
-            fiyat = bot.last_real_price or bot.last_sim_price
-            toplam += bot.coin_qty * fiyat
+            toplam += bot.coin_qty * bot.guncel_fiyat()
     return toplam
 
 
@@ -2734,7 +2906,7 @@ def print_performans_raporu(kasa: MerkeziKasa, pozisyonlar: dict, acik_pozisyon_
         print(f"  {'Sembol':<9} {'Yas':>6} {'Miktar':>12} {'Giris':>12} {'Guncel':>12} {'Hedef':>12} {'Stop':>12} "
               f"{'K/Z(TRY)':>10} {'K/Z%':>7}")
         for b in acik_olanlar:
-            fiyat = b.last_real_price or b.last_sim_price
+            fiyat = b.guncel_fiyat()
             deger = b.coin_qty * fiyat
             acik_seviye = next((lvl for lvl in b.grid if lvl.has_position), None)
             giris_fiyati = acik_seviye.buy_price if acik_seviye else 0.0
@@ -2798,7 +2970,7 @@ def x_raporu_olustur_ve_gonder(kasa: MerkeziKasa, pozisyonlar: dict, rapor: Rapo
     if acik_olanlar:
         satirlar = []
         for b in acik_olanlar:
-            fiyat = b.last_real_price or b.last_sim_price
+            fiyat = b.guncel_fiyat()
             acik_seviye = next((lvl for lvl in b.grid if lvl.has_position), None)
             giris = acik_seviye.buy_price if acik_seviye else 0.0
             kz_pct = ((fiyat - giris) / giris * 100) if giris else 0.0
@@ -2964,7 +3136,10 @@ def run_simulation():
         pozisyonlar: dict = {}
         acik_pozisyon_sayaci = [0]
         rapor = RaporlamaDurumu(TOPLAM_SANAL_BAKIYE_TRY)  # v11
-        print(f"{YELLOW}  Kayitli durum bulunamadi, temiz baslangic: {TOPLAM_SANAL_BAKIYE_TRY:,.2f} TRY{RESET}\n")
+        if CANLI_MOD:
+            print(f"{YELLOW}  Kayitli durum bulunamadi, temiz baslangic (bakiye borsadan cekilecek).{RESET}\n")
+        else:
+            print(f"{YELLOW}  Kayitli durum bulunamadi, temiz baslangic: {TOPLAM_SANAL_BAKIYE_TRY:,.2f} TRY{RESET}\n")
 
     # v17 FIX: CANLI MOD ise borsadan gercek bakiyeyi cek ve kasa ile esitle.
     # Cekilen gercek serbest TRY tutari SIFIRDAN BUYUKSE, kasa.baslangic VE
@@ -2976,17 +3151,26 @@ def run_simulation():
     if CANLI_MOD:
         try:
             gercek_bakiye = binance_serbest_try_bakiyesi()
-            print(f"{GREEN}  CANLI MOD AKTIF - borsadan cekilen serbest TRY bakiyesi: {gercek_bakiye:,.2f} TRY{RESET}\n")
-            if gercek_bakiye > 0:
-                kasa.baslangic = gercek_bakiye
-                kasa.bakiye = gercek_bakiye
-            else:
-                print(f"{YELLOW}  UYARI: Borsadan cekilen serbest TRY bakiyesi 0 (veya gecersiz) - "
-                      f"kasa.baslangic/kasa.bakiye GUNCELLENMEDI, mevcut/kayitli deger korundu. "
-                      f"[BORSA YANITI] satirini kontrol edin.{RESET}")
         except Exception as e:
             print(f"{RED}  HATA: Canli bakiye cekilemedi, bot baslatilamiyor: {e}{RESET}")
             return
+        print(f"{GREEN}  CANLI MOD AKTIF - borsadan cekilen serbest TRY bakiyesi: {gercek_bakiye:,.2f} TRY{RESET}\n")
+        if gercek_bakiye > 0:
+            kasa.baslangic = gercek_bakiye
+            kasa.bakiye = gercek_bakiye
+        else:
+            # Okuma basarili ve bakiye gercekten 0: kasa ASLA sanal
+            # TOPLAM_SANAL_BAKIYE_TRY ile kalmamali, yoksa bot var olmayan
+            # parayla gercek emir gondermeye calisir.
+            kasa.bakiye = 0.0
+            if not kayitli_durum:
+                kasa.baslangic = 0.0
+            print(f"{YELLOW}  UYARI: Borsadaki serbest TRY bakiyesi 0 - yeni alim yapilmayacak "
+                  f"(acik pozisyonlar yonetilmeye devam eder).{RESET}")
+        if not kayitli_durum:
+            rapor = RaporlamaDurumu(kasa.bakiye)  # X/Z tabanlari sanal degil gercek bakiyeden baslasin
+        elif any(b.has_open_position for b in pozisyonlar.values()):
+            mutabakat_yap(kasa, pozisyonlar)  # bot kapaliyken elle satilan/degisen pozisyonlari hemen yakala
         send_telegram(f"\U0001F7E2 <b>Project Aurelius CANLI MODDA baslatildi!</b>\nBorsa bakiyesi: {kasa.bakiye:,.2f} TRY")
     else:
         send_telegram(f"\U0001F9EA Project Aurelius SIMULASYON modunda baslatildi. Bakiye: {kasa.bakiye:,.2f} TRY")
@@ -3015,6 +3199,10 @@ def run_simulation():
             except Exception:
                 pass
 
+            # Sayac tick icinde canli guncellenir, ama basarisiz tasfiye / mutabakat
+            # ile kapatilan pozisyonlar gibi yollarla kayabilir; her tick gercekten
+            # yeniden kur.
+            acik_pozisyon_sayaci[0] = sum(1 for b in pozisyonlar.values() if b.has_open_position)
             guncel_bakiye = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
             izin_verilen_pozisyon, hedef_pozisyon_tutari, sniper_modu_aktif = dinamik_pozisyon_planla(
                 kasa.bakiye, guncel_bakiye, btc_degisim
@@ -3028,7 +3216,7 @@ def run_simulation():
                     dinamik_width = bilgi_map.get(sym, {}).get("width_pct", VARSAYILAN_WIDTH_PCT)  # v16
                     pozisyonlar[sym] = CoinBot(
                         symbol=sym,
-                        coin_name=sym.replace("TRY", ""),
+                        coin_name=_coin_adi(sym),
                         width_pct=dinamik_width,
                         grid_count=VARSAYILAN_GRID_SAYISI,
                         starting_try=0.0,
@@ -3063,6 +3251,14 @@ def run_simulation():
 
                 if not bot.initialized:
                     bot.setup_grid(fiyat)
+                elif not bot.has_open_position and (fiyat < bot.lower or fiyat > bot.upper):
+                    # Grid yalnizca ilk fiyatta kuruluyordu; fiyat bu banttan
+                    # ciktiginda evaluate_v9 yeni alimi engelledigi icin coin, izleme
+                    # listesinde kaldigi surece KALICI olarak alinamaz hale geliyordu.
+                    # Pozisyon yokken grid'i guncel fiyata (ve guncel ATR genisligine)
+                    # yeniden ortala.
+                    bot.width_pct = bilgi_map.get(sym, {}).get("width_pct", bot.width_pct)
+                    bot.setup_grid(fiyat)
 
                 if piyasa_sert_duste:
                     bot.stop_loss_kontrol(fiyat, sim=False, kasa=kasa, acik_pozisyon_sayaci=acik_pozisyon_sayaci,
@@ -3093,9 +3289,8 @@ def run_simulation():
                                   f"Tum pozisyonlar tasfiye ediliyor.")
                     for bot in pozisyonlar.values():
                         if bot.has_open_position:
-                            fiyat = bot.last_real_price or bot.last_sim_price
-                            bot.acil_tasfiye(fiyat, kasa, durum_kaydet=kaydet, rapor=rapor)
-                    acik_pozisyon_sayaci[0] = 0
+                            bot.acil_tasfiye(bot.guncel_fiyat(), kasa, durum_kaydet=kaydet, rapor=rapor)
+                    acik_pozisyon_sayaci[0] = sum(1 for b in pozisyonlar.values() if b.has_open_position)
                     print_trade_history_table(pozisyonlar.values())
                     print_performans_raporu(kasa, pozisyonlar, 0, izin_verilen_pozisyon=0)
                     print(f"{RED}Bot acil fren nedeniyle durduruldu. Ayarlardan MAX_DRAWDOWN_PCT degistirilebilir.{RESET}")
@@ -3176,11 +3371,12 @@ def run_simulation():
         print(f"{YELLOW}Hatirlatma: {'Bu CANLI bir oturumdu.' if CANLI_MOD else 'Bu bir simulasyondu.'}{RESET}")
     except Exception as e:
         print(f"\n{RED}{BOLD}KRITIK HATA: {e}{RESET}\n")
-        send_telegram(f"\U0001F6A8 Project Aurelius KRITIK HATA ile durdu: {e}")
+        send_telegram(f"\U0001F6A8 Project Aurelius KRITIK HATA ile durdu: {html.escape(str(e))}")
         raise
     finally:
         durumu_kaydet(kasa, pozisyonlar, rapor)
         print(f"{GRAY}  Durum kaydedildi: {STATE_DOSYASI}{RESET}")
+        telegram_kuyrugunu_bosalt()
 
 
 # ==========================================================================
@@ -3222,7 +3418,7 @@ def backtest_calistir(symbol: str, gun: int, sermaye: float = None):
 
     bot = CoinBot(
         symbol=symbol,
-        coin_name=symbol.replace("TRY", ""),
+        coin_name=_coin_adi(symbol),
         width_pct=VARSAYILAN_WIDTH_PCT,
         grid_count=VARSAYILAN_GRID_SAYISI,
         starting_try=sermaye,

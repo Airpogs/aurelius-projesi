@@ -72,7 +72,7 @@ def main():
               "ortam degiskenlerini kendi ortaminizda tanimlayip tekrar deneyin.")
         sys.exit(1)
 
-    print(f"\n[1/4] Serbest TRY bakiyesi cekiliyor...")
+    print("\n[1/4] Serbest TRY bakiyesi cekiliyor...")
     try:
         bakiye = m.binance_serbest_try_bakiyesi()
     except Exception as e:
@@ -110,16 +110,29 @@ def main():
         print(f"\nHATA: test tutari (~{test_tutari:.2f} TRY) serbest bakiyeden ({bakiye:.2f} TRY) buyuk.")
         sys.exit(1)
 
+    step_size = filtreler.get("step_size")
     ham_miktar = test_tutari / fiyat
-    miktar = m.miktari_lot_size_yuvarla(ham_miktar, filtreler.get("step_size"))
+    miktar = m.miktari_lot_size_yuvarla(ham_miktar, step_size)
+    # LOT_SIZE asagi yuvarlamasi tutari minNotional altina dusurebilir (borsa reddeder).
+    if step_size and min_notional and miktar * fiyat < min_notional:
+        miktar = m.miktari_lot_size_yuvarla(miktar + step_size, step_size)
     if miktar <= 0:
         print("\nHATA: LOT_SIZE yuvarlamasi sonrasi miktar 0 cikti - test tutari bu sembol icin cok kucuk.")
         sys.exit(1)
 
     tahmini_tutar = miktar * fiyat
-    print(f"\n[3/4] TEST EMRI OZETI")
-    print(f"      Sembol      : {symbol}")
-    print(f"      Yon         : BUY (MARKET)")
+    if tahmini_tutar > MAKS_TEST_TUTARI_TRY or tahmini_tutar > bakiye:
+        print(f"\nHATA: LOT_SIZE sonrasi tahmini tutar (~{tahmini_tutar:.2f} TRY) guvenlik sinirini "
+              f"veya serbest bakiyeyi asiyor - durduruldu.")
+        sys.exit(1)
+    if min_notional and tahmini_tutar < min_notional:
+        print(f"\nHATA: tahmini tutar (~{tahmini_tutar:.2f} TRY) minNotional ({min_notional}) altinda - "
+              "borsa reddeder, durduruldu.")
+        sys.exit(1)
+
+    print("\n[3/4] TEST EMRI OZETI")
+    print(f"      Sembol      : {symbol}  (Binance TR emir sembolu: {m.binance_tr_islem_sembolu(symbol)})")
+    print("      Yon         : BUY (MARKET)")
     print(f"      Miktar      : {miktar}")
     print(f"      Tahmini Tutar: ~{tahmini_tutar:.2f} TRY  (guvenlik sinirinin altinda: {MAKS_TEST_TUTARI_TRY:.2f} TRY)")
     print(f"      Base URL    : {m.BINANCE_TR_PRIVATE_BASE_URL}")
