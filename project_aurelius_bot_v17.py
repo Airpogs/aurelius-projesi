@@ -1323,6 +1323,27 @@ def _ag_hatasi_ipucu(hata: Exception) -> None:
         print(f"{YELLOW}  {satir}{RESET}")
 
 
+def _tls_ilk_yaniti_al(host: str, port: int) -> bytes:
+    """
+    Gercek bir TLS ClientHello gonderip karsidan gelen ILK baytlari ham
+    olarak dondurur. Normal bir sunucu TLS kaydiyla (0x16/0x15) yanit
+    verir; araya giren bir filtre/proxy ise genellikle duz bir HTTP
+    yaniti (orn. erisim engeli sayfasina yonlendirme) dondurur.
+    """
+    giden = ssl.MemoryBIO()
+    tls = ssl.create_default_context().wrap_bio(ssl.MemoryBIO(), giden, server_hostname=host)
+    try:
+        tls.do_handshake()
+    except ssl.SSLWantReadError:
+        pass
+    with socket.create_connection((host, port), timeout=10) as ham_soket:
+        ham_soket.sendall(giden.read())
+        try:
+            return ham_soket.recv(400)
+        except ConnectionResetError:
+            return b""
+
+
 def baglanti_testi() -> None:
     """
     'python project_aurelius_bot_v17.py baglanti' ile calisir. API anahtari
@@ -1350,15 +1371,25 @@ def baglanti_testi() -> None:
                 veren = dict(alan[0] for alan in tls.getpeercert().get("issuer", ()))
                 print(f"{GREEN}  [2] TLS OK ({tls.version()}) - sertifikayi veren: "
                       f"{veren.get('organizationName', '?')} / {veren.get('commonName', '?')}{RESET}")
+    except ssl.SSLCertVerificationError as e:
+        print(f"{RED}  [2] SERTIFIKA DOGRULANAMADI: {e}{RESET}")
+        print(f"{YELLOW}      Baglanti Binance TR'nin degil BASKA bir sertifikayla kuruluyor - antivirus "
+              f"(HTTPS tarama) veya bir ag cihazi trafigi araya girip inceliyor olabilir.{RESET}")
     except Exception as e:
         print(f"{RED}  [2] TLS HATASI (dogrudan, proxy'siz): {e}{RESET}")
         try:
-            with socket.create_connection((host, port), timeout=10) as ham_soket:
-                ham_soket.sendall(f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
-                ham_yanit = ham_soket.recv(300)
-            print(f"{YELLOW}      {port} portundan gelen duz metin yanit: {ham_yanit!r}{RESET}")
+            ham_yanit = _tls_ilk_yaniti_al(host, port)
+            if not ham_yanit:
+                print(f"{YELLOW}      Karsi taraf baglantiyi hemen KAPATTI - bir ag filtresi "
+                      f"baglantiyi kesiyor olabilir.{RESET}")
+            elif ham_yanit[:1] in (b"\x15", b"\x16"):
+                print(f"{YELLOW}      Karsi taraf simdi TLS ile yanit verdi - sorun ARALIKLI "
+                      f"olabilir, tekrar deneyin.{RESET}")
+            else:
+                print(f"{YELLOW}      TLS yerine gelen yanit (araya giren sistemi gosterir):{RESET}")
+                print(f"{YELLOW}      {ham_yanit[:400]!r}{RESET}")
         except Exception as e2:
-            print(f"{YELLOW}      (duz metin denemesi de basarisiz: {e2}){RESET}")
+            print(f"{YELLOW}      (ham yanit alinamadi: {e2}){RESET}")
 
     for etiket, url in (("[3] Ozel API sunucusu", f"{BINANCE_TR_PRIVATE_BASE_URL}/open/v1/common/time"),
                         ("[4] Piyasa verisi sunucusu", "https://api.binance.me/api/v3/time")):
