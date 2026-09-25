@@ -67,8 +67,8 @@ v17 FIX - BINANCE TR CANLI MOD API ENTEGRASYON DUZELTMESI (bakiye hep
      yaziliyor - "Invalid API-key" gibi hatalarin gercek nedeni artik
      kaybolmuyor.
   4) YENI _binance_tr_bakiye_listesini_cikar() yardimcisi: Binance TR'nin
-     GERCEK yanit zarfini ({"code":0,"data":{"balances":[...]}} VEYA
-     {"data":{"assets":[...]}}) destekler. Eski kod dogrudan kok dizinde
+     GERCEK yanit zarfini ({"code":0,"data":{"accountAssets":[...]}};
+     yedek olarak "balances"/"assets") destekler. Eski kod dogrudan kok dizinde
      "balances" aradigi icin liste HEP BOS donuyor, cuzdanda serbest TRY
      olsa bile bakiye SESSIZCE 0.00 TRY basiliyordu. binance_serbest_try_
      bakiyesi() VE mutabakat_yap() artik bu ortak yardimciyi kullaniyor;
@@ -1351,9 +1351,12 @@ def _binance_tr_bakiye_listesini_cikar(veri) -> Optional[list]:
     """
     v17 FIX: Binance TR'nin /open/v1/account/spot yaniti Binance Global'den
     FARKLI bir "zarf" (envelope) kullanir - bakiye listesi yanitin KOK
-    dizininde DEGIL, "data" sozlugu altinda gelir:
-        {"code": 0, "data": {"balances": [...]}}   VEYA
-        {"code": 0, "data": {"assets":   [...]}}
+    dizininde DEGIL, "data" sozlugu altinda "accountAssets" anahtariyla gelir:
+        {"code": 0, "msg": "Success", "data": {"canTrade": 1, ...,
+         "accountAssets": [{"asset": "TRY", "free": "0", "locked": "0"}, ...]}}
+    (Kaynak: ayni /open/v1 API ailesini kullanan Tokocrypto icin ccxt'nin
+    fetch_balance uygulamasi - Binance TR resmi dokumani degil.) Farkli bir
+    surum ihtimaline karsi "balances"/"assets" de yedek olarak denenir.
     "code" 0'dan farkliysa (API hatasi) veya format taninmiyorsa ham yaniti
     loglar ve None dondurur. None, "bakiye 0" ile KARISTIRILMAMALIDIR:
     cagiran taraf okunamayan bir yaniti asla sifir bakiye gibi kullanmamali.
@@ -1372,6 +1375,8 @@ def _binance_tr_bakiye_listesini_cikar(veri) -> Optional[list]:
 
     data = veri.get("data")
     if isinstance(data, dict):
+        if isinstance(data.get("accountAssets"), list):
+            return data["accountAssets"]
         if isinstance(data.get("balances"), list):
             return data["balances"]
         if isinstance(data.get("assets"), list):
@@ -1383,7 +1388,7 @@ def _binance_tr_bakiye_listesini_cikar(veri) -> Optional[list]:
         return veri["balances"]
 
     print(f"{RED}  BINANCE TR HESAP YANITI BEKLENMEYEN FORMATTA - ham yanit log dosyasina yazildi.{RESET}")
-    logger.error("Binance TR hesap yanitinda 'data.balances'/'data.assets' bulunamadi - ham yanit: %r", veri)
+    logger.error("Binance TR hesap yanitinda 'data.accountAssets' bulunamadi - ham yanit: %r", veri)
     return None
 
 
@@ -1424,10 +1429,40 @@ def binance_hesap_bakiyeleri() -> dict:
     return bakiyeler
 
 
+def bakiye_ozeti_yazdir(bakiyeler: dict) -> None:
+    """
+    Borsadaki SIFIRDAN FARKLI varliklari (serbest/kilitli) okunakli bir
+    tablo olarak basar. Bot SADECE serbest TRY ile alim yapar; bu ozet,
+    "bakiye 0 gorunuyor" durumunda paranin nerede oldugunu (acik emirde
+    kilitli TRY, USDT/coin olarak duran bakiye) hemen gosterir.
+    """
+    dolu = {v: b for v, b in bakiyeler.items() if b["free"] > 0 or b["locked"] > 0}
+    print(f"{CYAN}  BORSADAKI VARLIKLARINIZ ({len(dolu)} adet sifirdan farkli):{RESET}")
+    for varlik, b in sorted(dolu.items(), key=lambda x: (x[0] != "TRY", x[0]))[:20]:
+        print(f"{CYAN}    {varlik:<8} serbest: {b['free']:>18,.8f}   kilitli: {b['locked']:>18,.8f}{RESET}")
+    if len(dolu) > 20:
+        print(f"{CYAN}    ... ve {len(dolu) - 20} varlik daha{RESET}")
+
+    try_kaydi = bakiyeler.get("TRY", {"free": 0.0, "locked": 0.0})
+    if try_kaydi["free"] > 0:
+        return
+    if try_kaydi["locked"] > 0:
+        print(f"{YELLOW}  NOT: {try_kaydi['locked']:,.2f} TRY acik emirlerde KILITLI - bot sadece SERBEST TRY "
+              f"kullanir. Binance TR'de acik emirleri iptal ederseniz serbest bakiyeye doner.{RESET}")
+    diger = [v for v in dolu if v != "TRY"]
+    if diger:
+        print(f"{YELLOW}  NOT: Bakiyeniz TRY disinda varliklarda ({', '.join(diger[:8])}"
+              f"{'...' if len(diger) > 8 else ''}). Bot alimlari SADECE serbest TRY ile yapar - "
+              f"kullanmak istediginiz tutari Binance TR'de TRY'ye cevirin.{RESET}")
+    elif not dolu:
+        print(f"{YELLOW}  NOT: Hesapta hic bakiye gorunmuyor. Para Binance TR SPOT cuzdaninda mi? "
+              f"(API anahtari dogru HESABA mi ait?){RESET}")
+
+
 def binance_serbest_try_bakiyesi() -> float:
     """
     v17 FIX: /open/v1/account/spot uzerinden GERCEK serbest TRY bakiyesini
-    ceker ("data.balances"/"data.assets" zarfi - bkz. binance_hesap_
+    ceker ("data.accountAssets" zarfi - bkz. binance_hesap_
     bakiyeleri). Yanit okunamazsa RuntimeError firlatir; boylece bir API
     hatasi "0.00 TRY" gibi gorunup kasayi sifirlamaz (mutabakat sonrasi
     sahte ACIL FREN tetiklemesine yol acabiliyordu). Yanit gecerli ama TRY
@@ -3240,10 +3275,12 @@ def run_simulation():
     # SESSIZCE sifirlanmaz - mevcut/kayitli deger korunur ve acikca uyarilir.
     if CANLI_MOD:
         try:
-            gercek_bakiye = binance_serbest_try_bakiyesi()
+            bakiyeler = binance_hesap_bakiyeleri()
         except Exception as e:
             print(f"{RED}  HATA: Canli bakiye cekilemedi, bot baslatilamiyor: {e}{RESET}")
             return
+        bakiye_ozeti_yazdir(bakiyeler)
+        gercek_bakiye = bakiyeler.get("TRY", {}).get("free", 0.0)
         print(f"{GREEN}  CANLI MOD AKTIF - borsadan cekilen serbest TRY bakiyesi: {gercek_bakiye:,.2f} TRY{RESET}\n")
         if gercek_bakiye > 0:
             kasa.baslangic = gercek_bakiye
