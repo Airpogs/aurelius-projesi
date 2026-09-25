@@ -454,6 +454,8 @@ import urllib.error
 import hmac
 import hashlib
 import json
+import socket
+import ssl
 import csv
 import os
 import sys
@@ -1289,6 +1291,88 @@ def _borsa_hata_ipucu(kod, mesaj) -> None:
         print(f"{YELLOW}  {satir}{RESET}")
 
 
+def _python_proxy_ayarlari() -> dict:
+    """Python'un (urllib) http/https isteklerinde kullanacagi proxy (ortam degiskeni veya Windows ayari)."""
+    return {k: v for k, v in urllib.request.getproxies().items() if k in ("http", "https")}
+
+
+def _ag_hatasi_ipucu(hata: Exception) -> None:
+    """
+    Borsaya hic ulasilamadiginda (SSL/baglanti hatasi) olasi nedenleri ve
+    Python'un kullandigi proxy ayarini Turkce olarak basar.
+    """
+    metin = str(hata)
+    if "WRONG_VERSION_NUMBER" in metin or "SSL" in metin:
+        satirlar = [
+            "NEDEN: Sifreli (TLS) baglanti kurulamadi - bilgisayariniz ile borsa arasindaki bir",
+            "       sey (VPN, antivirusun 'HTTPS/SSL tarama' ozelligi, proxy veya ag filtresi)",
+            "       sifreli yanit yerine duz metin dondurdu. Kod/API anahtari ile ilgili DEGIL.",
+        ]
+    else:
+        satirlar = ["NEDEN: Borsaya baglanti kurulamadi (internet, DNS, VPN veya guvenlik duvari)."]
+    proxyler = _python_proxy_ayarlari()
+    satirlar += [
+        f"Python'un kullandigi proxy: {proxyler or 'yok'}",
+        "Ne yapmali: VPN'i kapatip/acip, antivirusun HTTPS taramasini gecici kapatip veya",
+        "baska bir aga (orn. telefon hotspot) gecip tekrar deneyin. Ayrintili teshis icin:",
+        "    python project_aurelius_bot_v17.py baglanti",
+    ]
+    if proxyler:
+        satirlar.append("Proxy'yi bu pencerede devre disi birakmak icin:  set NO_PROXY=*")
+    for satir in satirlar:
+        print(f"{YELLOW}  {satir}{RESET}")
+
+
+def baglanti_testi() -> None:
+    """
+    'python project_aurelius_bot_v17.py baglanti' ile calisir. API anahtari
+    GEREKTIRMEZ, emir GONDERMEZ. Binance TR'ye giden yolu adim adim test
+    eder (DNS -> TLS el sikisma -> ozel API sunucusu -> piyasa verisi
+    sunucusu) ve sorunun nerede oldugunu gosterir.
+    """
+    adres = urllib.parse.urlparse(BINANCE_TR_PRIVATE_BASE_URL)
+    host, port = adres.hostname, adres.port or 443
+    proxyler = _python_proxy_ayarlari()
+    print(f"{BOLD}BAGLANTI TESTI - {host}{RESET}")
+    print(f"  Python {sys.version.split()[0]} | {ssl.OPENSSL_VERSION}")
+    print(f"  Python'un kullandigi proxy: {proxyler or 'yok'}")
+
+    try:
+        ipler = sorted({a[4][0] for a in socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)})
+        print(f"{GREEN}  [1] DNS OK: {host} -> {', '.join(ipler)}{RESET}")
+    except Exception as e:
+        print(f"{RED}  [1] DNS HATASI: {e} - internet baglantinizi / DNS ayarinizi kontrol edin.{RESET}")
+        return
+
+    try:
+        with socket.create_connection((host, port), timeout=10) as ham_soket:
+            with ssl.create_default_context().wrap_socket(ham_soket, server_hostname=host) as tls:
+                veren = dict(alan[0] for alan in tls.getpeercert().get("issuer", ()))
+                print(f"{GREEN}  [2] TLS OK ({tls.version()}) - sertifikayi veren: "
+                      f"{veren.get('organizationName', '?')} / {veren.get('commonName', '?')}{RESET}")
+    except Exception as e:
+        print(f"{RED}  [2] TLS HATASI (dogrudan, proxy'siz): {e}{RESET}")
+        try:
+            with socket.create_connection((host, port), timeout=10) as ham_soket:
+                ham_soket.sendall(f"GET / HTTP/1.0\r\nHost: {host}\r\n\r\n".encode())
+                ham_yanit = ham_soket.recv(300)
+            print(f"{YELLOW}      {port} portundan gelen duz metin yanit: {ham_yanit!r}{RESET}")
+        except Exception as e2:
+            print(f"{YELLOW}      (duz metin denemesi de basarisiz: {e2}){RESET}")
+
+    for etiket, url in (("[3] Ozel API sunucusu", f"{BINANCE_TR_PRIVATE_BASE_URL}/open/v1/common/time"),
+                        ("[4] Piyasa verisi sunucusu", "https://api.binance.me/api/v3/time")):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "project-aurelius-bot"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                print(f"{GREEN}  {etiket} OK: HTTP {resp.status} {resp.read(150)!r}{RESET}")
+        except urllib.error.HTTPError as e:
+            print(f"{GREEN}  {etiket} ULASILDI (HTTP {e.code}) - baglanti calisiyor.{RESET}")
+        except Exception as e:
+            print(f"{RED}  {etiket} HATASI: {e}{RESET}")
+    print("\n  Bu ekranin goruntusunu paylasabilirsiniz (API anahtari icermez).")
+
+
 def binance_signed_request(method: str, path: str, params: Optional[dict] = None):
     """
     v17 FIX: CANLI MOD icin RFC 2104 HMAC-SHA256 imzali istek gonderir.
@@ -1344,6 +1428,8 @@ def binance_signed_request(method: str, path: str, params: Optional[dict] = None
     except Exception as e:
         print(f"{RED}  BINANCE TR IMZALI ISTEK BEKLENMEYEN HATA ({method} {path}): {e}{RESET}")
         logger.error("Binance TR imzali istek beklenmeyen hata (%s %s): %s", method, path, e)
+        if isinstance(e, (urllib.error.URLError, OSError)):
+            _ag_hatasi_ipucu(e)
         raise
 
 
@@ -3597,6 +3683,8 @@ def main():
         gun = int(sys.argv[3]) if len(sys.argv) > 3 else 30
         sermaye = float(sys.argv[4]) if len(sys.argv) > 4 else None
         backtest_calistir(symbol, gun, sermaye)
+    elif len(sys.argv) > 1 and sys.argv[1].lower() == "baglanti":
+        baglanti_testi()
     else:
         run_simulation()
 
