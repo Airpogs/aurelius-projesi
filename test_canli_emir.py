@@ -39,6 +39,7 @@ Windows cmd (TIRNAKSIZ - tirnaklar degerin parcasi olur; ayni pencerede calistir
     set AURELIUS_LIVE_CONFIRM=EVET_GERCEK_PARA_KULLAN
     python test_canli_emir.py PEPETRY
 """
+import glob
 import importlib.util
 import os
 import sys
@@ -49,12 +50,38 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BOT_DOSYA_YOLU = os.path.join(_SCRIPT_DIR, "project_aurelius_bot_v17.py")
 
 
+def _bot_dosyasini_bul():
+    """
+    Bot dosyasini bu scriptin klasorunde arar. Windows ayni adli ikinci
+    indirmeyi 'project_aurelius_bot_v17 (1).py' diye kaydeder; tek bir
+    boyle aday varsa onu kullanir. Bulamazsa klasordeki .py dosyalarini
+    listeleyip neyin yanlis oldugunu soyler.
+    """
+    if os.path.exists(BOT_DOSYA_YOLU):
+        return BOT_DOSYA_YOLU
+    adaylar = sorted(glob.glob(os.path.join(_SCRIPT_DIR, "project_aurelius_bot_v17*.py")))
+    if len(adaylar) == 1:
+        print(f"NOT: '{os.path.basename(adaylar[0])}' kullaniliyor "
+              f"(adi tam olarak project_aurelius_bot_v17.py degil).")
+        return adaylar[0]
+
+    print(f"HATA: '{_SCRIPT_DIR}' klasorunde project_aurelius_bot_v17.py bulunamadi.")
+    if adaylar:
+        print("Birden fazla kopya var - GUNCEL olani 'project_aurelius_bot_v17.py' olarak "
+              "yeniden adlandirip digerlerini silin:")
+        for aday in adaylar:
+            print(f"    {os.path.basename(aday)}")
+    else:
+        py_dosyalari = sorted(f for f in os.listdir(_SCRIPT_DIR) if ".py" in f.lower())
+        print(f"Bu klasordeki Python dosyalari: {', '.join(py_dosyalari) or '(hic yok)'}")
+        print("Bot dosyasini bu klasore indirin ve adinin tam olarak "
+              "'project_aurelius_bot_v17.py' oldugundan emin olun.")
+    sys.exit(1)
+
+
 def _bot_modulunu_yukle():
-    if not os.path.exists(BOT_DOSYA_YOLU):
-        print(f"HATA: {BOT_DOSYA_YOLU} bulunamadi - bu scripti project_aurelius_bot_v17.py "
-              f"ile AYNI klasore koyun.")
-        sys.exit(1)
-    spec = importlib.util.spec_from_file_location("aurelius_bot", BOT_DOSYA_YOLU)
+    bot_dosyasi = _bot_dosyasini_bul()
+    spec = importlib.util.spec_from_file_location("aurelius_bot", bot_dosyasi)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
