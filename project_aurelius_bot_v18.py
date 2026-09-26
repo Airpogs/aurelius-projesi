@@ -3895,7 +3895,9 @@ def telegram_komutunu_uygula(komut: str, kasa: "MerkeziKasa", pozisyonlar: dict,
         mesaj = (f"\u2705 <b>{satilan} pozisyon satildi.</b>\nYeni alimlar DURDURULDU "
                  f"(acmak icin /devam).")
         if kalan:
-            mesaj += f"\n\u26a0\ufe0f Satilamayan: {html.escape(', '.join(kalan))} - bot tekrar deneyecek."
+            mesaj += (f"\n\u26a0\ufe0f Satilamayan: {html.escape(', '.join(kalan))} - bu pozisyon acik kaldi "
+                      f"(stop/kar-al kurallariyla yonetilmeye devam eder). Tekrar denemek icin /hepsinisat, "
+                      f"ya da Binance TR'den kontrol edin.")
         send_telegram(mesaj)
     elif komut in ("/yardim", "/help", "/start"):
         send_telegram(TELEGRAM_YARDIM_METNI)
