@@ -1344,6 +1344,17 @@ def _tls_ilk_yaniti_al(host: str, port: int) -> bytes:
             return b""
 
 
+def _ham_yanit_ozeti(ham: bytes) -> str:
+    """_tls_ilk_yaniti_al() sonucunu okunur bir satira cevirir."""
+    if not ham:
+        return "BOS: baglanti hemen kapatildi"
+    if ham[:1] == b"\x16":
+        return "TLS el sikisma yaniti (normal)"
+    if ham[:1] == b"\x15":
+        return f"TLS uyari (alert) kaydi: {ham[:7].hex(' ')}"
+    return f"TLS DISI YANIT: {ham[:300]!r}"
+
+
 def baglanti_testi() -> None:
     """
     'python project_aurelius_bot_v17.py baglanti' ile calisir. API anahtari
@@ -1365,42 +1376,78 @@ def baglanti_testi() -> None:
         print(f"{RED}  [1] DNS HATASI: {e} - internet baglantinizi / DNS ayarinizi kontrol edin.{RESET}")
         return
 
-    try:
-        with socket.create_connection((host, port), timeout=10) as ham_soket:
-            with ssl.create_default_context().wrap_socket(ham_soket, server_hostname=host) as tls:
-                veren = dict(alan[0] for alan in tls.getpeercert().get("issuer", ()))
-                print(f"{GREEN}  [2] TLS OK ({tls.version()}) - sertifikayi veren: "
-                      f"{veren.get('organizationName', '?')} / {veren.get('commonName', '?')}{RESET}")
-    except ssl.SSLCertVerificationError as e:
-        print(f"{RED}  [2] SERTIFIKA DOGRULANAMADI: {e}{RESET}")
+    # [2] Dogrudan TLS el sikisma - sorun aralikli olabildigi icin birkac kez denenir.
+    deneme_sayisi = 5
+    basarili, hatalar, tls_bilgi, sertifika_hatasi = 0, [], "", None
+    for _ in range(deneme_sayisi):
+        try:
+            with socket.create_connection((host, port), timeout=10) as ham_soket:
+                with ssl.create_default_context().wrap_socket(ham_soket, server_hostname=host) as tls:
+                    veren = dict(alan[0] for alan in tls.getpeercert().get("issuer", ()))
+                    tls_bilgi = (f"{tls.version()}, sertifikayi veren: "
+                                 f"{veren.get('organizationName', '?')} / {veren.get('commonName', '?')}")
+                    basarili += 1
+        except ssl.SSLCertVerificationError as e:
+            sertifika_hatasi = e
+            break
+        except Exception as e:
+            hatalar.append(str(e))
+
+    if sertifika_hatasi is not None:
+        print(f"{RED}  [2] SERTIFIKA DOGRULANAMADI: {sertifika_hatasi}{RESET}")
         print(f"{YELLOW}      Baglanti Binance TR'nin degil BASKA bir sertifikayla kuruluyor - antivirus "
               f"(HTTPS tarama) veya bir ag cihazi trafigi araya girip inceliyor olabilir.{RESET}")
-    except Exception as e:
-        print(f"{RED}  [2] TLS HATASI (dogrudan, proxy'siz): {e}{RESET}")
-        try:
-            ham_yanit = _tls_ilk_yaniti_al(host, port)
-            if not ham_yanit:
-                print(f"{YELLOW}      Karsi taraf baglantiyi hemen KAPATTI - bir ag filtresi "
-                      f"baglantiyi kesiyor olabilir.{RESET}")
-            elif ham_yanit[:1] in (b"\x15", b"\x16"):
-                print(f"{YELLOW}      Karsi taraf simdi TLS ile yanit verdi - sorun ARALIKLI "
-                      f"olabilir, tekrar deneyin.{RESET}")
-            else:
-                print(f"{YELLOW}      TLS yerine gelen yanit (araya giren sistemi gosterir):{RESET}")
-                print(f"{YELLOW}      {ham_yanit[:400]!r}{RESET}")
-        except Exception as e2:
-            print(f"{YELLOW}      (ham yanit alinamadi: {e2}){RESET}")
+    else:
+        renk = GREEN if basarili == deneme_sayisi else (YELLOW if basarili else RED)
+        print(f"{renk}  [2] TLS el sikisma: {deneme_sayisi} denemeden {basarili} basarili"
+              f"{f' ({tls_bilgi})' if tls_bilgi else ''}{RESET}")
+        for hata in dict.fromkeys(hatalar):
+            print(f"{RED}      Hata ({hatalar.count(hata)} kez): {hata}{RESET}")
 
-    for etiket, url in (("[3] Ozel API sunucusu", f"{BINANCE_TR_PRIVATE_BASE_URL}/open/v1/common/time"),
-                        ("[4] Piyasa verisi sunucusu", "https://api.binance.me/api/v3/time")):
+    tls_disi_yanit = False
+    if hatalar:
+        ornekler = []
+        for _ in range(deneme_sayisi):
+            try:
+                ornekler.append(_ham_yanit_ozeti(_tls_ilk_yaniti_al(host, port)))
+            except Exception as e:
+                ornekler.append(f"(alinamadi: {e})")
+        print(f"{YELLOW}      TLS istegine karsi gelen ilk yanitlar ({deneme_sayisi} deneme):{RESET}")
+        for ornek in dict.fromkeys(ornekler):
+            print(f"{YELLOW}        - {ornekler.count(ornek)} kez: {ornek}{RESET}")
+        tls_disi_yanit = any(o.startswith(("TLS DISI", "BOS")) for o in ornekler)
+
+    sonuclar = {}
+    for anahtar, etiket, url in (
+            ("ozel", "[3] Ozel API sunucusu", f"{BINANCE_TR_PRIVATE_BASE_URL}/open/v1/common/time"),
+            ("piyasa", "[4] Piyasa verisi sunucusu", "https://api.binance.me/api/v3/time")):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "project-aurelius-bot"})
             with urllib.request.urlopen(req, timeout=10) as resp:
                 print(f"{GREEN}  {etiket} OK: HTTP {resp.status} {resp.read(150)!r}{RESET}")
+            sonuclar[anahtar] = True
         except urllib.error.HTTPError as e:
             print(f"{GREEN}  {etiket} ULASILDI (HTTP {e.code}) - baglanti calisiyor.{RESET}")
+            sonuclar[anahtar] = True
         except Exception as e:
             print(f"{RED}  {etiket} HATASI: {e}{RESET}")
+            sonuclar[anahtar] = False
+
+    print()
+    if not hatalar and sertifika_hatasi is None and all(sonuclar.values()):
+        print(f"{GREEN}{BOLD}  SONUC: Baglanti sorunsuz.{RESET}")
+    elif (hatalar or not sonuclar["ozel"]) and sonuclar["piyasa"]:
+        for satir in (
+            f"SONUC: Internete cikabiliyorsunuz (piyasa sunucusu OK), ama {host} baglantilarina",
+            "aradaki bir sistem mudahale ediyor" + (" (sifreli yanit yerine baska bir yanit geliyor)."
+                                                    if tls_disi_yanit else "."),
+            "Bu, botun veya API anahtarinin sorunu DEGIL. Olasi kaynaklar:",
+            " - bagli oldugunuz agin guvenlik duvari / icerik filtresi (yurt, is yeri, okul, site agi)",
+            " - internet saglayicinizin 'Guvenli Internet' filtresi veya modemdeki ebeveyn denetimi",
+            " - bilgisayardaki guvenlik yazilimi (web koruma / ebeveyn denetimi)",
+            "Kaynagi ayirt etmek icin ayni testi baska bir baglantiyla (orn. telefonun mobil verisi) deneyin.",
+        ):
+            print(f"{YELLOW}{BOLD}  {satir}{RESET}")
     print("\n  Bu ekranin goruntusunu paylasabilirsiniz (API anahtari icermez).")
 
 
