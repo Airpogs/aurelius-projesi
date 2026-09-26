@@ -397,6 +397,7 @@ v10 farki - BES KRITIK KATMAN (v9'un risk/strateji cekirdegi DEGISTIRILMEDI):
            set BINANCE_TR_API_KEY=anahtariniz
            set BINANCE_TR_SECRET_KEY=gizli_anahtariniz
            set AURELIUS_LIVE_CONFIRM=EVET_GERCEK_PARA_KULLAN
+           set AURELIUS_CANLI_MOD=1   (dosyada CANLI_MOD'u duzenlemeden acar)
        PowerShell: $env:BINANCE_TR_API_KEY="anahtariniz" (vb.)
        Degiskenler SADECE o terminal penceresinde gecerlidir; botu ayni
        pencereden calistirin.
@@ -686,6 +687,12 @@ TELEGRAM_BOT_TOKEN = _ortam_degiskeni_str_oku("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = _ortam_degiskeni_str_oku("TELEGRAM_CHAT_ID")
 BINANCE_TR_API_KEY = _ortam_degiskeni_str_oku("BINANCE_TR_API_KEY")
 BINANCE_TR_SECRET_KEY = _ortam_degiskeni_str_oku("BINANCE_TR_SECRET_KEY")
+
+# Canli modu dosyayi duzenlemeden acmak icin: AURELIUS_CANLI_MOD=1. Her yeni
+# indirmede CANLI_MOD yukarida yine False gelir; bu degisken o adimi gereksiz
+# kilar. Ek guvenlik onayi (AURELIUS_LIVE_CONFIRM) yine AYRICA zorunludur.
+if _ortam_degiskeni_str_oku("AURELIUS_CANLI_MOD") == "1":
+    CANLI_MOD = True
 
 REAL_POLL_INTERVAL_SECONDS = 25
 SUB_TICK_SECONDS = 2
