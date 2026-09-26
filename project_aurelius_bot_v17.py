@@ -1115,6 +1115,13 @@ def _aktif_calisma_modu() -> str:
     return "CANLI" if CANLI_MOD else "SIMULASYON"
 
 
+class CanliDurumKorumasi(Exception):
+    """CANLI modda kaydedilmis durum dosyasi varken bot SIMULASYON modunda
+    baslatildi. Dosya kenara alinirsa sonraki canli baslatmada acik gercek
+    pozisyonlar unutulur (stop-loss/kar-al yonetimi olmadan kalir); bu yuzden
+    bot hic baslatilmaz ve dosyaya dokunulmaz."""
+
+
 def durumu_yukle() -> Optional[dict]:
     """v10: STATE_DOSYASI varsa okur ve dondurur. Yoksa veya bozuksa
     None doner (bu durumda temiz baslangic yapilir).
@@ -1136,8 +1143,19 @@ def durumu_yukle() -> Optional[dict]:
 
     kayitli_mod = veri.get("calisma_modu", "SIMULASYON")
     aktif_mod = _aktif_calisma_modu()
+    if kayitli_mod == "CANLI" and aktif_mod != "CANLI":
+        acik = sum(1 for p in veri.get("pozisyonlar", {}).values()
+                   if any(l.get("has_position") for l in p.get("grid", [])))
+        raise CanliDurumKorumasi(
+            f"HATA: Bu klasordeki durum dosyasi CANLI modda kaydedilmis ({acik} acik gercek pozisyon), "
+            f"ama bot su an {aktif_mod} modunda baslatildi.\n"
+            "  Canli kaydi korumak icin bot BASLATILMADI, dosyaya dokunulmadi.\n"
+            "  Canli devam etmek icin 'set AURELIUS_CANLI_MOD=1' satirini (ve diger set satirlarini)\n"
+            "  yazip tekrar baslatin. Simulasyon denemek istiyorsaniz botu BASKA bir klasorde calistirin.")
     if kayitli_mod != aktif_mod:
         yedek = f"{STATE_DOSYASI}.{kayitli_mod.lower()}.yedek"
+        if os.path.exists(yedek):  # onceki bir yedegin uzerine asla yazma
+            yedek = f"{yedek}.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         try:
             os.replace(STATE_DOSYASI, yedek)
             yedek_notu = f"eski dosya '{os.path.basename(yedek)}' olarak yedeklendi"
@@ -3416,7 +3434,11 @@ def run_simulation():
               f"ve periyodik olarak piyasayi yeniden tarayacak.{RESET}\n")
 
     # v10 BOLUM 1: onceki oturumdan kalici durum var mi kontrol et
-    kayitli_durum = durumu_yukle()
+    try:
+        kayitli_durum = durumu_yukle()
+    except CanliDurumKorumasi as e:
+        print(f"{RED}{BOLD}  {e}{RESET}")
+        return
     if kayitli_durum:
         kasa, pozisyonlar, acik_baslangic_sayisi = durumdan_kasa_ve_pozisyonlar_olustur(kayitli_durum)
         acik_pozisyon_sayaci = [acik_baslangic_sayisi]
