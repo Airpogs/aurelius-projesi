@@ -1,7 +1,28 @@
 """
-PROJECT AURELIUS - v17
+PROJECT AURELIUS - v18
 Binance TR AKILLI SECIM Grid Trading Bot - PIYASA ADAPTIF MOTOR VE OTONOM SERMAYE DONGUSU
 ======================================================================
+v18 - KESINTI ONLEMLERI (bot kapaliyken pozisyonlar korumasiz kalmasin):
+  1) Durum bildirimi: AURELIUS_DURUM_BILDIRIM_SAAT (varsayilan 2, 0=kapali)
+     saatte bir Telegram'a portfoy ozeti. AURELIUS_SAGLIK_URL verilirse
+     (orn. healthchecks.io ping adresi) 5 dk'da bir "calisiyorum" sinyali;
+     sinyal kesilirse (elektrik kesintisi dahil) o servis size haber verir.
+  2) Otomatik yeniden baslatma: 'python project_aurelius_bot_v18.py kurulum'
+     bu penceredeki ayarlarla baslat.bat (Linux: baslat.sh) olusturur; bot
+     coker/baslayamazsa 60 sn sonra yeniden baslar. Istege bagli: Windows
+     oturumu acilinca otomatik baslatma. Cikis kodlari: 0 bilincli durdurma,
+     1 gecici hata/cokme (yeniden baslat), 2 ayar hatasi.
+  3) Bosaltma modu (/bosalt): yeni alim yapilmaz, pozisyonlar kapaninca bot
+     durur. Ctrl+C'de acik pozisyon varsa "birak / hepsini sat" sorulur.
+  4) Telegram komutlari (sadece TELEGRAM_CHAT_ID'den): /durum /alimdurdur
+     /devam /bosalt /hepsinisat (+ /onayla) /yardim. Kapatmak icin
+     AURELIUS_TELEGRAM_KOMUT=0. Bot kapaliyken gonderilen komutlar yok sayilir.
+  5) Borsada koruyucu stop emri (AURELIUS_BORSA_STOP=1, varsayilan KAPALI):
+     her pozisyon icin borsaya STOP_LOSS_LIMIT satis emri konur (tetik: bot
+     stop'unun %1 alti), stop yukseldikce emir yukari tasinir, bot satmadan
+     once emri iptal eder. Bot/bilgisayar kapaliyken de borsa zarari keser.
+     Emir turu RESMI olarak dogrulanmadi - ilk kullanimda [BORSA YANITI]
+     satirlarini ve Binance TR'deki acik emirlerinizi kontrol edin.
 v17 FIX-2 - TAM KOD INCELEMESI DUZELTMELERI:
   CANLI EMIR GUVENLIGI
   - Emir (POST) istekleri artik otomatik tekrar denenmiyor (zaman asimi/
@@ -442,8 +463,8 @@ YAPMAZ; her emir tek seferde MARKET emri olarak gonderilir ve sonucu
 dogrudan API yanitindan okunur.
 
 Kullanim:
-    python project_aurelius_bot_v17.py                          (canli/simulasyon - CANLI_MOD bayragina gore)
-    python project_aurelius_bot_v17.py backtest SEMBOL GUN [SERMAYE]  (backtest - her zaman simulasyon)
+    python project_aurelius_bot_v18.py                          (canli/simulasyon - CANLI_MOD bayragina gore)
+    python project_aurelius_bot_v18.py backtest SEMBOL GUN [SERMAYE]  (backtest - her zaman simulasyon)
 """
 
 import time
@@ -621,6 +642,14 @@ RECV_WINDOW_MS = 5000
 # bu kodlara cevirir.
 ORDER_SIDE_KODU = {"BUY": "0", "SELL": "1"}
 ORDER_TIPI_MARKET_KODU = "2"
+# v18: Borsada bekleyen koruyucu stop emri icin (AURELIUS_BORSA_STOP=1). Kaynak:
+# ayni /open/v1 API ailesini kullanan ccxt (Tokocrypto) ve topluluk kutuphanesi -
+# RESMI Binance TR dokumani DEGIL; ilk kullanimda [BORSA YANITI] satirlarini kontrol edin.
+ORDER_TIPI_STOP_LOSS_LIMIT_KODU = "4"
+ORDER_CANCEL_ENDPOINT_PATH = "/open/v1/orders/cancel"
+ORDER_DETAIL_ENDPOINT_PATH = "/open/v1/orders/detail"
+EMIR_DURUMLARI = {-2: "ISLENIYOR", 0: "YENI", 1: "KISMEN-DOLDU", 2: "DOLDU", 3: "IPTAL",
+                  4: "IPTAL-BEKLIYOR", 5: "REDDEDILDI", 6: "SURESI-DOLDU"}
 
 
 def _coin_adi(symbol: str) -> str:
@@ -693,6 +722,51 @@ BINANCE_TR_SECRET_KEY = _ortam_degiskeni_str_oku("BINANCE_TR_SECRET_KEY")
 # kilar. Ek guvenlik onayi (AURELIUS_LIVE_CONFIRM) yine AYRICA zorunludur.
 if _ortam_degiskeni_str_oku("AURELIUS_CANLI_MOD") == "1":
     CANLI_MOD = True
+
+
+def _ortam_sayisi_oku(isim: str, varsayilan: float) -> float:
+    deger = _ortam_degiskeni_str_oku(isim)
+    if not deger:
+        return varsayilan
+    try:
+        return float(deger.replace(",", "."))
+    except ValueError:
+        print(f"{isim} sayi olarak okunamadi ({deger!r}); varsayilan {varsayilan} kullaniliyor.")
+        return varsayilan
+
+
+# v18 KESINTI ONLEMLERI
+# (1) Periyodik "bot calisiyor" durum bildirimi (saat, 0 = kapali) ve istege bagli dis
+#     saglik pingi (orn. healthchecks.io ping adresi): bot durursa (elektrik kesintisi
+#     dahil) o servis size haber verir.
+DURUM_BILDIRIM_SAAT = _ortam_sayisi_oku("AURELIUS_DURUM_BILDIRIM_SAAT", 2.0)
+SAGLIK_PING_URL = _ortam_degiskeni_str_oku("AURELIUS_SAGLIK_URL")
+SAGLIK_PING_ARALIGI_SANIYE = 300
+# (4) Telegram komutlari - SADECE TELEGRAM_CHAT_ID'den gelenler kabul edilir.
+#     Kapatmak icin AURELIUS_TELEGRAM_KOMUT=0.
+TELEGRAM_KOMUTLARI_AKTIF = _ortam_degiskeni_str_oku("AURELIUS_TELEGRAM_KOMUT") != "0"
+HEPSINI_SAT_ONAY_SANIYE = 60
+# (5) Borsada bekleyen koruyucu stop emri - varsayilan KAPALI, AURELIUS_BORSA_STOP=1 ile
+#     acilir. Tetik fiyati botun kendi stop'unun BORSA_STOP_TAMPON_PCT altindadir: bot
+#     calisirken once kendi stop'u satar, bot kapaliyken borsadaki emir satar.
+BORSA_STOP_AKTIF = _ortam_degiskeni_str_oku("AURELIUS_BORSA_STOP") == "1"
+BORSA_STOP_TAMPON_PCT = 0.01
+BORSA_STOP_LIMIT_ARALIK_PCT = 0.01      # limit fiyati tetigin bu kadar altinda (dolma sansi icin)
+BORSA_STOP_GUNCELLEME_ESIGI_PCT = 0.01  # bot stop'u bu kadar yukselince borsadaki emir yukseltilir
+BORSA_STOP_GUNCELLEME_MIN_SANIYE = 300
+BORSA_STOP_SORGU_SANIYE = 120
+BORSA_STOP_HATA_BEKLEME_SANIYE = 120
+# (2) Cikis kodlari - 'kurulum' ile olusturulan baslatici bunlara gore davranir.
+CIKIS_DUR = 0            # bilincli durdurma (Ctrl+C, bosaltma bitti, ACIL FREN): yeniden baslatma
+CIKIS_YENIDEN_DENE = 1   # gecici sorun (ag, bakiye okunamadi) veya cokme: yeniden baslat
+CIKIS_AYAR_HATASI = 2    # eksik anahtar / mod uyusmazligi: yeniden baslatmak ise yaramaz
+# (3)/(4) Yeni alim durumu - durum dosyasina kaydedilir, yeniden baslatmada korunur.
+ALIM_DURUMU_ACIKLAMA = {
+    "ACIK": "ACIK",
+    "DURDURULDU": "DURDURULDU (acik pozisyonlar yonetilmeye devam ediyor)",
+    "BOSALTMA": "BOSALTMA (yeni alim yok; pozisyonlar kapaninca bot duracak)",
+}
+_alim_durumu = "ACIK"
 
 REAL_POLL_INTERVAL_SECONDS = 25
 SUB_TICK_SECONDS = 2
@@ -1064,6 +1138,7 @@ def durumu_kaydet(kasa: "MerkeziKasa", pozisyonlar: dict, rapor: "RaporlamaDurum
     try:
         veri = {
             "calisma_modu": _aktif_calisma_modu(),
+            "alim_durumu": _alim_durumu,  # v18
             "kasa_bakiye": kasa.bakiye,
             "kasa_baslangic": kasa.baslangic,
             "kasa_toplam_komisyon": kasa.toplam_komisyon,
@@ -1099,6 +1174,9 @@ def durumu_kaydet(kasa: "MerkeziKasa", pozisyonlar: dict, rapor: "RaporlamaDurum
                         "buy_price": lvl.buy_price,
                         "en_yuksek_fiyat": lvl.en_yuksek_fiyat,
                         "kismi_kar_alindi": lvl.kismi_kar_alindi,
+                        "borsa_stop_emir_id": lvl.borsa_stop_emir_id,  # v18
+                        "borsa_stop_fiyati": lvl.borsa_stop_fiyati,
+                        "borsa_stop_miktari": lvl.borsa_stop_miktari,
                     }
                     for lvl in b.grid
                 ],
@@ -1208,6 +1286,9 @@ def durumdan_kasa_ve_pozisyonlar_olustur(veri: dict):
                 buy_price=lvl["buy_price"],
                 en_yuksek_fiyat=lvl["en_yuksek_fiyat"],
                 kismi_kar_alindi=lvl.get("kismi_kar_alindi", False),
+                borsa_stop_emir_id=lvl.get("borsa_stop_emir_id"),  # v18
+                borsa_stop_fiyati=lvl.get("borsa_stop_fiyati", 0.0),
+                borsa_stop_miktari=lvl.get("borsa_stop_miktari", 0.0),
             )
             for lvl in p.get("grid", [])
         ]
@@ -1340,7 +1421,7 @@ def _ag_hatasi_ipucu(hata: Exception) -> None:
         f"Python'un kullandigi proxy: {proxyler or 'yok'}",
         "Ne yapmali: VPN'i kapatip/acip, antivirusun HTTPS taramasini gecici kapatip veya",
         "baska bir aga (orn. telefon hotspot) gecip tekrar deneyin. Ayrintili teshis icin:",
-        "    python project_aurelius_bot_v17.py baglanti",
+        "    python project_aurelius_bot_v18.py baglanti",
     ]
     if proxyler:
         satirlar.append("Proxy'yi bu pencerede devre disi birakmak icin:  set NO_PROXY=*")
@@ -1382,7 +1463,7 @@ def _ham_yanit_ozeti(ham: bytes) -> str:
 
 def baglanti_testi() -> None:
     """
-    'python project_aurelius_bot_v17.py baglanti' ile calisir. API anahtari
+    'python project_aurelius_bot_v18.py baglanti' ile calisir. API anahtari
     GEREKTIRMEZ, emir GONDERMEZ. Binance TR'ye giden yolu adim adim test
     eder (DNS -> TLS el sikisma -> ozel API sunucusu -> piyasa verisi
     sunucusu) ve sorunun nerede oldugunu gosterir.
@@ -1719,6 +1800,8 @@ def mutabakat_yap(kasa: "MerkeziKasa", pozisyonlar: dict) -> None:
             if acik_seviye:
                 acik_seviye.has_position = False
                 acik_seviye.buy_qty = 0.0
+                acik_seviye.borsa_stop_emir_id = None
+                acik_seviye.borsa_stop_fiyati = 0.0
             continue
 
         # Sadece ASAGI senkronize et: borsadaki fazlalik kullanicinin bot
@@ -1745,10 +1828,13 @@ def sembol_filtrelerini_getir(symbol: str) -> dict:
     req = urllib.request.Request(EXCHANGE_INFO_URL, headers={"User-Agent": "grid-bot-sim"})
     data = http_istek_yap(req, timeout=20)
 
-    sonuc = {"step_size": None, "min_notional": None}
+    sonuc = {"step_size": None, "min_notional": None, "tick_size": None, "order_types": None}
     for s in data.get("symbols", []):
         if s.get("symbol") == symbol:
+            sonuc["order_types"] = s.get("orderTypes")
             for f in s.get("filters", []):
+                if f.get("filterType") == "PRICE_FILTER":
+                    sonuc["tick_size"] = float(f.get("tickSize", 0)) or None
                 if f.get("filterType") == "LOT_SIZE":
                     sonuc["step_size"] = float(f.get("stepSize", 0))
                 if f.get("filterType") in ("MIN_NOTIONAL", "NOTIONAL"):
@@ -1766,7 +1852,9 @@ def miktari_lot_size_yuvarla(qty: float, step_size: Optional[float]) -> float:
     if not step_size or step_size <= 0:
         return qty
     adim = Decimal(str(step_size))
-    miktar = Decimal(str(qty))
+    # round(..., 12): 96*0.99 = 95.03999999999999 gibi kayan nokta artiklari bir
+    # basamak fazla asagi yuvarlanmasin (gercek deger 95.04).
+    miktar = Decimal(str(round(qty, 12)))
     birim_sayisi = (miktar / adim).to_integral_value(rounding=ROUND_DOWN)
     return float(birim_sayisi * adim)
 
@@ -1807,6 +1895,99 @@ def binance_gercek_emir_gonder(symbol: str, side: str, quantity: float) -> dict:
         mesaj = sonuc.get("msg") or sonuc.get("message") or "(mesaj yok)"
         raise RuntimeError(f"Binance TR emri reddetti: code={sonuc.get('code')} msg={mesaj}")
     return sonuc
+
+
+def _sayi_metni(deger: float) -> str:
+    """Emir parametresi icin bilimsel gosterimsiz sayi (1e-05 yerine 0.00001)."""
+    return f"{deger:.8f}".rstrip("0").rstrip(".") or "0"
+
+
+def fiyati_tick_yuvarla(fiyat: float, tick_size: Optional[float]) -> float:
+    """Fiyati PRICE_FILTER tickSize basamagina ASAGI yuvarlar."""
+    if not tick_size or tick_size <= 0:
+        return fiyat
+    adim = Decimal(str(tick_size))
+    return float((Decimal(str(round(fiyat, 12))) / adim).to_integral_value(rounding=ROUND_DOWN) * adim)
+
+
+def _binance_emir_yaniti(sonuc, islem: str, yazdir: bool = True) -> dict:
+    """Emir/iptal/sorgu yanitini dogrular ve 'data' kismini dondurur. code != 0 ise
+    (HTTP 200 olsa bile) RuntimeError firlatir."""
+    if yazdir:
+        print(f"{GRAY}[BORSA YANITI]: {sonuc!r}{RESET}")
+    if not isinstance(sonuc, dict):
+        raise RuntimeError(f"Binance TR {islem} yaniti beklenmeyen formatta: {sonuc!r}")
+    if sonuc.get("code") not in (0, None):
+        mesaj = sonuc.get("msg") or sonuc.get("message") or "(mesaj yok)"
+        raise RuntimeError(f"Binance TR {islem} reddetti: code={sonuc.get('code')} msg={mesaj}")
+    data = sonuc.get("data", sonuc)
+    if isinstance(data, dict) and isinstance(data.get("list"), list):
+        data = data["list"][0] if data["list"] else {}
+    return data if isinstance(data, dict) else {}
+
+
+def _emir_bilgisi(data: dict) -> dict:
+    """Emir kaydindan durum, gerceklesen miktar ve ortalama fiyati cikarir."""
+    def sayi(anahtar: str) -> float:
+        try:
+            return float(data.get(anahtar) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+    try:
+        durum = int(data.get("status"))
+    except (TypeError, ValueError):
+        durum = None
+    miktar, tutar = sayi("executedQty"), sayi("executedQuoteQty")
+    fiyat = tutar / miktar if (miktar and tutar) else (sayi("avgPrice") or sayi("executedPrice"))
+    return {"status": durum, "executedQty": miktar, "executedPrice": fiyat}
+
+
+def binance_stop_limit_satis_emri(symbol: str, quantity: float, stop_fiyati: float,
+                                  limit_fiyati: float) -> str:
+    """Borsada bekleyen STOP_LOSS_LIMIT SATIS emri kurar, emir numarasini dondurur.
+    Fiyat stop_fiyati'na inince borsa, limit_fiyati'ndan (veya daha iyisinden) satar."""
+    params = {
+        "symbol": binance_tr_islem_sembolu(symbol),
+        "side": ORDER_SIDE_KODU["SELL"],
+        "type": ORDER_TIPI_STOP_LOSS_LIMIT_KODU,
+        "quantity": _sayi_metni(quantity),
+        "price": _sayi_metni(limit_fiyati),
+        "stopPrice": _sayi_metni(stop_fiyati),
+    }
+    try:
+        data = _binance_emir_yaniti(binance_signed_request("POST", ORDER_ENDPOINT_PATH, params), "stop emrini")
+    except RuntimeError as e:
+        if "timeinforce" not in str(e).lower():
+            raise
+        params["timeInForce"] = "1"  # GTC - borsa bu alani zorunlu tutuyorsa bir kez daha dene
+        data = _binance_emir_yaniti(binance_signed_request("POST", ORDER_ENDPOINT_PATH, params), "stop emrini")
+    emir_id = data.get("orderId")
+    if emir_id in (None, "", 0):
+        raise RuntimeError(f"Binance TR stop emri yanitinda emir numarasi (orderId) yok: {data!r}")
+    return str(emir_id)
+
+
+def binance_emir_iptal(emir_id: str) -> dict:
+    """Bekleyen bir emri iptal eder; emir bilgisini (_emir_bilgisi) dondurur."""
+    sonuc = binance_signed_request("POST", ORDER_CANCEL_ENDPOINT_PATH, {"orderId": emir_id})
+    if isinstance(sonuc, dict) and sonuc.get("code") == 3219:  # "Already cancelled"
+        print(f"{GRAY}[BORSA YANITI]: {sonuc!r}{RESET}")
+        return {"status": 3, "executedQty": 0.0, "executedPrice": 0.0}
+    return _emir_bilgisi(_binance_emir_yaniti(sonuc, "emir iptalini"))
+
+
+def binance_emir_sorgula(emir_id: str) -> dict:
+    """Emrin guncel durumunu sorgular (once /orders/detail, olmazsa /orders?orderId=)."""
+    try:
+        data = _binance_emir_yaniti(binance_signed_request("GET", ORDER_DETAIL_ENDPOINT_PATH,
+                                                           {"orderId": emir_id}), "emir sorgusunu", yazdir=False)
+    except Exception as ilk_hata:
+        try:
+            data = _binance_emir_yaniti(binance_signed_request("GET", ORDER_ENDPOINT_PATH,
+                                                               {"orderId": emir_id}), "emir sorgusunu", yazdir=False)
+        except Exception:
+            raise ilk_hata
+    return _emir_bilgisi(data)
 
 
 def canli_mod_on_kontrol() -> bool:
@@ -1895,6 +2076,12 @@ class GridLevel:
     buy_price: float = 0.0
     en_yuksek_fiyat: float = 0.0
     kismi_kar_alindi: bool = False  # v13: kademeli kar alma bu seviyede bir kez yapildi mi
+    borsa_stop_emir_id: Optional[str] = None  # v18: borsada bekleyen koruyucu stop emri
+    borsa_stop_fiyati: float = 0.0
+    borsa_stop_miktari: float = 0.0
+    borsa_stop_son_islem: float = 0.0   # kaydedilmez: son kurma/iptal zamani (monotonic)
+    borsa_stop_son_sorgu: float = 0.0   # kaydedilmez: son durum sorgusu (monotonic)
+    borsa_stop_hata_sayisi: int = 0     # kaydedilmez
 
 
 def _cooldown_suresi_hesapla(tag: str) -> float:
@@ -1917,7 +2104,7 @@ def _cooldown_suresi_hesapla(tag: str) -> float:
         return COOLDOWN_KAR_DAKIKA
     if tag == "ZAMAN-ASIMI":
         return COOLDOWN_ZAMAN_ASIMI_DAKIKA
-    if tag in ("STOP-LOSS", "BREAKEVEN-STOP", "ACIL-TASFIYE"):
+    if tag in ("STOP-LOSS", "BREAKEVEN-STOP", "ACIL-TASFIYE", "BORSA-STOP", "MANUEL-KAPANIS"):
         return COOLDOWN_ZARAR_DAKIKA
     return COOLDOWN_MINUTES  # bilinmeyen etiket icin guvenli varsayilan
 
@@ -2277,10 +2464,178 @@ class CoinBot:
                 return hedef, stop, etiket
         return None, None, None
 
+    # ------------------------------------------------------------
+    # v18: BORSADA BEKLEYEN KORUYUCU STOP EMRI (AURELIUS_BORSA_STOP=1)
+    # ------------------------------------------------------------
+    def _borsa_koruma_fiyatlari(self, level: "GridLevel") -> tuple:
+        """(tetik, limit): tetik botun guncel ratchet stop'unun BORSA_STOP_TAMPON_PCT
+        altinda - bot calisirken once kendi stop'u devreye girer."""
+        stop, _ = self._ratchet_stop_hesapla(level)
+        tetik = stop * (1 - BORSA_STOP_TAMPON_PCT)
+        return tetik, tetik * (1 - BORSA_STOP_LIMIT_ARALIK_PCT)
+
+    def borsa_stopunu_kur(self, level: "GridLevel", zorla: bool = False,
+                          durum_kaydet: Optional[object] = None) -> bool:
+        """Seviye icin borsada STOP_LOSS_LIMIT satis emri kurar. Basarisizlikta bot
+        kendi stop'uyla korumaya devam eder; BORSA_STOP_HATA_BEKLEME_SANIYE sonra
+        tekrar denenir."""
+        if not (CANLI_MOD and BORSA_STOP_AKTIF) or not level.has_position or level.borsa_stop_emir_id:
+            return False
+        simdi = time.monotonic()
+        if (not zorla and level.borsa_stop_hata_sayisi
+                and simdi - level.borsa_stop_son_islem < BORSA_STOP_HATA_BEKLEME_SANIYE):
+            return False
+        level.borsa_stop_son_islem = simdi
+        ilk_kurulum = level.borsa_stop_fiyati <= 0
+        coin_yok = False
+        try:
+            filtreler = sembol_filtrelerini_getir(self.symbol)
+            tipler = filtreler.get("order_types")
+            if tipler and "STOP_LOSS_LIMIT" not in tipler:
+                raise RuntimeError(f"bu sembolde STOP_LOSS_LIMIT emri desteklenmiyor ({', '.join(tipler)})")
+            kayit = binance_hesap_bakiyeleri().get(self.coin_name, {})
+            serbest, kilitli = kayit.get("free", 0.0), kayit.get("locked", 0.0)
+            if serbest + kilitli <= level.buy_qty * 0.01:
+                coin_yok = True
+                raise RuntimeError("coin borsada yok (elle satilmis olabilir) - mutabakatta kapatilacak")
+            miktar = miktari_lot_size_yuvarla(min(level.buy_qty, serbest), filtreler.get("step_size"))
+            tetik, limit = self._borsa_koruma_fiyatlari(level)
+            tetik = fiyati_tick_yuvarla(tetik, filtreler.get("tick_size"))
+            limit = fiyati_tick_yuvarla(limit, filtreler.get("tick_size"))
+            guncel = self.guncel_fiyat()
+            if guncel and tetik >= guncel * 0.998:
+                raise RuntimeError(f"tetik ({format_fiyat(tetik)}) guncel fiyata ({format_fiyat(guncel)}) "
+                                   f"cok yakin - botun kendi stop'u devrede")
+            if miktar <= 0 or limit <= 0:
+                raise RuntimeError(f"miktar/fiyat gecersiz (miktar={miktar}, serbest={serbest}, kilitli={kilitli})")
+            min_notional = filtreler.get("min_notional")
+            if min_notional and miktar * limit < min_notional:
+                raise RuntimeError(f"emir tutari minNotional altinda ({miktar * limit:.2f} < {min_notional})")
+            emir_id = binance_stop_limit_satis_emri(self.symbol, miktar, tetik, limit)
+        except Exception as e:
+            level.borsa_stop_hata_sayisi += 1
+            print(f"{YELLOW}  BORSA STOP kurulamadi ({self.symbol}): {e} - bot calistigi surece "
+                  f"kendi stop'u gecerli.{RESET}")
+            logger.warning("Borsa stop kurulamadi (%s): %s", self.symbol, e)
+            if level.borsa_stop_hata_sayisi == 3 and not coin_yok:
+                send_telegram(f"\u26a0\ufe0f <b>{self.symbol} borsa stop emri kurulamiyor</b>\n"
+                              f"{html.escape(str(e))}\nBot calistigi surece kendi stop'u gecerli; "
+                              f"bot kapanirsa bu pozisyon korumasiz kalir.")
+            return False
+        level.borsa_stop_emir_id = emir_id
+        level.borsa_stop_fiyati = tetik
+        level.borsa_stop_miktari = miktar
+        level.borsa_stop_hata_sayisi = 0
+        level.borsa_stop_son_sorgu = simdi
+        print(f"{GREEN}  BORSA STOP kuruldu ({self.symbol}): {_sayi_metni(miktar)} adet, tetik "
+              f"{format_fiyat(tetik)} / limit {format_fiyat(limit)} TRY (emir {emir_id}){RESET}")
+        if ilk_kurulum:
+            send_telegram(f"\U0001F6E1 <b>{self.symbol} borsa stop emri kuruldu</b>\n"
+                          f"Tetik: {format_fiyat(tetik)} TRY - bot kapali olsa bile borsa bu fiyatta satar.")
+        if durum_kaydet is not None:
+            durum_kaydet()  # emir numarasi kaybolmasin (yetim emir coinleri kilitli tutar)
+        return True
+
+    def borsa_stopunu_iptal_et(self, level: "GridLevel") -> tuple:
+        """Seviyenin borsa stop emrini iptal eder. Donus (durum, bilgi):
+        'YOK' emir yok, 'IPTAL' iptal edildi/zaten aktif degil, 'DOLDU' emir zaten
+        gerceklesmis (cagiran taraf satisi kaydetmeli), 'HATA' iptal edilemedi."""
+        emir_id = level.borsa_stop_emir_id
+        if not emir_id:
+            return "YOK", None
+        level.borsa_stop_son_islem = time.monotonic()
+        try:
+            bilgi = binance_emir_iptal(emir_id)
+        except Exception as e:
+            try:
+                bilgi = binance_emir_sorgula(emir_id)
+            except Exception as e2:
+                print(f"{RED}  BORSA STOP iptal edilemedi ve durumu okunamadi ({self.symbol}, emir "
+                      f"{emir_id}): {e} / {e2}{RESET}")
+                return "HATA", None
+            if bilgi["status"] == 2:
+                level.borsa_stop_emir_id = None
+                return "DOLDU", bilgi
+            if bilgi["status"] in (3, 5, 6):
+                level.borsa_stop_emir_id = None
+                return "IPTAL", bilgi
+            print(f"{RED}  BORSA STOP iptal edilemedi ({self.symbol}, emir {emir_id}, durum "
+                  f"{EMIR_DURUMLARI.get(bilgi['status'], bilgi['status'])}): {e}{RESET}")
+            return "HATA", bilgi
+        level.borsa_stop_emir_id = None
+        if bilgi.get("status") == 2:
+            return "DOLDU", bilgi
+        if bilgi.get("executedQty"):
+            print(f"{YELLOW}  BORSA STOP iptalinden once {_sayi_metni(bilgi['executedQty'])} adet "
+                  f"gerceklesmisti ({self.symbol}) - miktar mutabakatta duzelir.{RESET}")
+        print(f"{GRAY}  BORSA STOP iptal edildi ({self.symbol}, emir {emir_id}).{RESET}")
+        return "IPTAL", bilgi
+
+    def _borsa_stop_dolumunu_isle(self, level: "GridLevel", bilgi: Optional[dict],
+                                  kasa: Optional[MerkeziKasa], acik_pozisyon_sayaci: Optional[list],
+                                  rapor: Optional["RaporlamaDurumu"], durum_kaydet: Optional[object]) -> bool:
+        """Borsada gerceklesmis stop emrini (ek emir gondermeden) ic muhasebeye isler."""
+        bilgi = bilgi or {}
+        miktar = bilgi.get("executedQty") or level.borsa_stop_miktari or level.buy_qty
+        fiyat = bilgi.get("executedPrice") or level.borsa_stop_fiyati or self.guncel_fiyat()
+        print(f"{YELLOW}{BOLD}  BORSA STOP GERCEKLESTI ({self.symbol}): {_sayi_metni(miktar)} adet "
+              f"~{format_fiyat(fiyat)} TRY{RESET}")
+        send_telegram(f"\U0001F6E1 <b>{self.symbol} borsa stop emri gerceklesti</b>\n"
+                      f"{_sayi_metni(miktar)} adet ~{format_fiyat(fiyat)} TRY'den satildi.")
+        return self._satisi_uygula(level, fiyat, "BORSA-STOP", False, kasa, acik_pozisyon_sayaci,
+                                   rapor, durum_kaydet, borsada_gerceklesen=(miktar, fiyat))
+
+    def borsa_stop_bakimi(self, kasa: Optional[MerkeziKasa], acik_pozisyon_sayaci: Optional[list] = None,
+                          rapor: Optional["RaporlamaDurumu"] = None, durum_kaydet: Optional[object] = None,
+                          zorla_sorgu: bool = False, yeni_kur: bool = True) -> None:
+        """Her tick'te cagrilir: eksik emri kurar, emrin durumunu periyodik sorgular
+        (doldu -> kaydet, iptal/red -> yeniden kur) ve bot stop'u yukseldikce
+        borsadaki emri yukari tasir (asla asagi indirmez)."""
+        if not CANLI_MOD or kasa is None:
+            return
+        for level in self.grid:
+            if not level.has_position:
+                continue
+            simdi = time.monotonic()
+            if not level.borsa_stop_emir_id:
+                yeni_alim = (self.alis_zamani is not None
+                             and (datetime.now() - self.alis_zamani).total_seconds() < 20)
+                if BORSA_STOP_AKTIF and yeni_kur and not yeni_alim:  # alinan coin hesaba gecsin
+                    self.borsa_stopunu_kur(level, durum_kaydet=durum_kaydet)
+                continue
+            if zorla_sorgu or simdi - level.borsa_stop_son_sorgu >= BORSA_STOP_SORGU_SANIYE:
+                level.borsa_stop_son_sorgu = simdi
+                try:
+                    bilgi = binance_emir_sorgula(level.borsa_stop_emir_id)
+                except Exception as e:
+                    print(f"{YELLOW}  BORSA STOP durumu okunamadi ({self.symbol}): {e}{RESET}")
+                    continue
+                if bilgi["status"] == 2:
+                    level.borsa_stop_emir_id = None
+                    self._borsa_stop_dolumunu_isle(level, bilgi, kasa, acik_pozisyon_sayaci, rapor, durum_kaydet)
+                    continue
+                if bilgi["status"] in (3, 5, 6):
+                    print(f"{YELLOW}  BORSA STOP emri artik aktif degil ({self.symbol}, durum "
+                          f"{EMIR_DURUMLARI.get(bilgi['status'])}) - yeniden kurulacak.{RESET}")
+                    level.borsa_stop_emir_id = None
+                    continue
+            if not BORSA_STOP_AKTIF:
+                continue
+            tetik, _ = self._borsa_koruma_fiyatlari(level)
+            if (tetik > level.borsa_stop_fiyati * (1 + BORSA_STOP_GUNCELLEME_ESIGI_PCT)
+                    and simdi - level.borsa_stop_son_islem >= BORSA_STOP_GUNCELLEME_MIN_SANIYE):
+                durum, bilgi = self.borsa_stopunu_iptal_et(level)
+                if durum == "DOLDU":
+                    self._borsa_stop_dolumunu_isle(level, bilgi, kasa, acik_pozisyon_sayaci, rapor, durum_kaydet)
+                elif durum == "IPTAL":
+                    time.sleep(1.0)  # kilitli coinler serbest bakiyeye gecsin
+                    self.borsa_stopunu_kur(level, zorla=True, durum_kaydet=durum_kaydet)
+
     def _satisi_uygula(self, level: "GridLevel", price: float, tag: str, sim: bool,
                         kasa: Optional[MerkeziKasa], acik_pozisyon_sayaci: Optional[list],
                         rapor: Optional["RaporlamaDurumu"], durum_kaydet: Optional[object],
-                        miktar: Optional[float] = None) -> bool:
+                        miktar: Optional[float] = None,
+                        borsada_gerceklesen: Optional[tuple] = None) -> bool:
         """
         v16: TUM SATIS/KAPANIS yollari (STOP-LOSS, BREAKEVEN-STOP,
         TRAILING-STOP, KAR-AL, ZAMAN-ASIMI, ACIL-TASFIYE, KISMI-KAR-AL)
@@ -2300,6 +2655,11 @@ class CoinBot:
 
         Basarili olursa True, CANLI_MOD'da gercek emir basarisiz olursa
         False doner (bu durumda HICBIR ic durum degismez).
+
+        v18: borsada_gerceklesen=(miktar, fiyat) verilirse satis borsada ZATEN
+        olmustur (koruyucu stop emri doldu): emir gonderilmez, sadece muhasebe yapilir.
+        Seviyenin borsada bekleyen stop emri varsa satistan ONCE iptal edilir
+        (coinler o emirde kilitliyken satis emri reddedilir).
         """
         tam_kapanis_niyeti = miktar is None
         onceki_level_qty = level.buy_qty
@@ -2307,12 +2667,26 @@ class CoinBot:
         if sell_qty <= 0:
             return False
 
-        exec_price = self._slipajli_fiyat(price, "SATIM")
-        if CANLI_MOD and kasa is not None:
-            dogrulanmis_qty = self._canli_emir_dogrula_ve_gonder("SELL", sell_qty, exec_price)
-            if dogrulanmis_qty is None:
-                return False  # gercek emir gitmedi - ic durum degismez, sonraki tick'te tekrar denenir
-            sell_qty = dogrulanmis_qty
+        if borsada_gerceklesen is not None:
+            sell_qty = borsada_gerceklesen[0] or sell_qty
+            exec_price = borsada_gerceklesen[1] or price
+        else:
+            exec_price = self._slipajli_fiyat(price, "SATIM")
+            if CANLI_MOD and kasa is not None:
+                if level.borsa_stop_emir_id:
+                    durum, bilgi = self.borsa_stopunu_iptal_et(level)
+                    if durum == "DOLDU":
+                        return self._borsa_stop_dolumunu_isle(level, bilgi, kasa, acik_pozisyon_sayaci,
+                                                              rapor, durum_kaydet)
+                    if durum == "HATA":
+                        print(f"{RED}  SATIS ERTELENDI ({self.symbol} {tag}): borsadaki stop emri iptal "
+                              f"edilemedi, sonraki turda tekrar denenecek.{RESET}")
+                        return False
+                    time.sleep(1.0)  # kilitli coinler serbest bakiyeye gecsin
+                dogrulanmis_qty = self._canli_emir_dogrula_ve_gonder("SELL", sell_qty, exec_price)
+                if dogrulanmis_qty is None:
+                    return False  # gercek emir gitmedi - ic durum degismez, sonraki tick'te tekrar denenir
+                sell_qty = dogrulanmis_qty
 
         # CANLI modda tam kapanista satilan miktar LOT_SIZE yuvarlamasi /
         # komisyon kesintisi yuzunden ic kayittan biraz az olabilir. Kalan
@@ -2336,6 +2710,10 @@ class CoinBot:
         if tam_kapanis:
             level.has_position = False
             level.buy_qty = 0.0
+            level.borsa_stop_emir_id = None  # v18
+            level.borsa_stop_fiyati = 0.0
+            level.borsa_stop_miktari = 0.0
+            level.borsa_stop_hata_sayisi = 0
             if not any(lvl.has_position for lvl in self.grid):
                 self.coin_qty = 0.0  # kayan nokta artigi has_open_position'i True birakmasin
             self.alis_zamani = None  # v16
@@ -2996,7 +3374,7 @@ def coin_degerlendir_ve_sec(semboller: list, sayisi: int):
 
 def print_banner():
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - v17'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - v18'.center(74)}{RESET}")
     print(f"{BOLD}{CYAN}  BINANCE TR AKILLI SECIM GRID BOT  |  PIYASA ADAPTIF MOTOR{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
     if CANLI_MOD:
@@ -3038,6 +3416,12 @@ def print_banner():
     print(f"{GRAY}  Acil fren limiti   : %{MAX_DRAWDOWN_PCT * 100:.0f}{RESET}")
     print(f"{GRAY}  Durum dosyasi      : {STATE_DOSYASI}{RESET}")
     print(f"{GRAY}  Telegram bildirimi : {'AKTIF (arka plan kuyrugu)' if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else 'kapali (TELEGRAM_BOT_TOKEN/CHAT_ID tanimli degil)'}{RESET}")
+    telegram_hazir = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+    print(f"{GRAY}  Telegram komutlari : {'AKTIF (/yardim)' if (telegram_hazir and TELEGRAM_KOMUTLARI_AKTIF) else 'kapali'}{RESET}")
+    print(f"{GRAY}  Durum bildirimi    : {f'her {DURUM_BILDIRIM_SAAT:g} saatte bir' if (telegram_hazir and DURUM_BILDIRIM_SAAT > 0) else 'kapali'}{RESET}")
+    print(f"{GRAY}  Saglik pingi       : {'AKTIF (her 5 dk)' if SAGLIK_PING_URL else 'kapali (AURELIUS_SAGLIK_URL tanimli degil)'}{RESET}")
+    if CANLI_MOD:
+        print(f"{GRAY}  Borsa stop emri    : {f'AKTIF (tetik = bot stop-%{BORSA_STOP_TAMPON_PCT*100:g})' if BORSA_STOP_AKTIF else 'kapali (AURELIUS_BORSA_STOP=1 ile acilir)'}{RESET}")
     print(f"{GRAY}  Hata log dosyasi   : {LOG_DOSYASI}{RESET}")
     print(f"{GRAY}  Gunluk X raporu    : her 24 saatte bir (sayac restart'ta sifirlanmaz){RESET}")
     print(f"{GRAY}  Aylik Z raporu     : her 30 gunde bir -> {os.path.basename(Z_RAPORLARI_CSV)}{RESET}")
@@ -3403,23 +3787,342 @@ def print_trade_history_table(pozisyonlar):
 # CANLI/SIMULASYON CALISTIRMA (v10)
 # ==========================================================================
 
+# ==========================================================================
+# v18 KESINTI ONLEMLERI: durum bildirimi, saglik pingi, Telegram komutlari,
+# bosaltma modu, kapanis sorusu, baslatici kurulumu
+# ==========================================================================
+
+TELEGRAM_YARDIM_METNI = (
+    "<b>Project Aurelius komutlari</b>\n"
+    "/durum - portfoy ve acik pozisyonlar\n"
+    "/alimdurdur - yeni alimlari durdur (acik pozisyonlar yonetilmeye devam eder)\n"
+    "/devam - yeni alimlari yeniden ac\n"
+    "/bosalt - yeni alim yapma; acik pozisyonlar kapaninca botu durdur\n"
+    "/hepsinisat - tum pozisyonlari piyasa fiyatindan sat (onay ister)\n"
+    "/yardim - bu liste"
+)
+
+
+def durum_ozeti_metni(kasa: "MerkeziKasa", pozisyonlar: dict) -> str:
+    """/durum komutu ve periyodik durum bildirimi icin kisa HTML ozet."""
+    satirlar = [
+        f"<b>Project Aurelius</b> ({_aktif_calisma_modu()}) - {datetime.now().strftime('%d.%m %H:%M')}",
+        f"Portfoy: {v9_toplam_portfoy_degeri(kasa, pozisyonlar):,.2f} TRY | Nakit: {kasa.bakiye:,.2f} TRY",
+        f"Yeni alimlar: {ALIM_DURUMU_ACIKLAMA.get(_alim_durumu, _alim_durumu)}",
+    ]
+    acik = [b for b in pozisyonlar.values() if b.has_open_position]
+    if not acik:
+        satirlar.append("Acik pozisyon yok.")
+    for b in acik:
+        seviye = next((lvl for lvl in b.grid if lvl.has_position), None)
+        if seviye is None:
+            continue
+        fiyat = b.guncel_fiyat()
+        kar_pct = (fiyat / seviye.buy_price - 1) * 100 if seviye.buy_price else 0.0
+        stop, _ = b._ratchet_stop_hesapla(seviye)
+        koruma = (f", borsa stop {format_fiyat(seviye.borsa_stop_fiyati)}"
+                  if seviye.borsa_stop_emir_id else "")
+        satirlar.append(f"- {b.symbol}: {format_fiyat(fiyat)} TRY ({kar_pct:+.2f}%), "
+                        f"stop {format_fiyat(stop)}{koruma}, {_yas_formatla(b.alis_zamani)}")
+    return "\n".join(satirlar)
+
+
+def tum_pozisyonlari_kapat(pozisyonlar: dict, kasa: "MerkeziKasa", durum_kaydet, rapor,
+                           acik_pozisyon_sayaci: Optional[list], tag: str = "MANUEL-KAPANIS") -> tuple:
+    """Tum acik pozisyonlari guncel fiyattan satar. Donus: (satilan_sayi, satilamayan_semboller)."""
+    satilan, kalan = 0, []
+    for bot in pozisyonlar.values():
+        if not bot.has_open_position:
+            continue
+        try:
+            fiyat = get_last_price(bot.symbol)
+            bot.last_real_price = fiyat
+        except Exception:
+            fiyat = bot.guncel_fiyat()
+        basarili = True
+        for seviye in bot.grid:
+            if seviye.has_position:
+                basarili = bot._satisi_uygula(seviye, fiyat, tag, False, kasa, acik_pozisyon_sayaci,
+                                              rapor, durum_kaydet) and basarili
+        if basarili and not bot.has_open_position:
+            satilan += 1
+        else:
+            kalan.append(bot.symbol)
+    if acik_pozisyon_sayaci is not None:
+        acik_pozisyon_sayaci[0] = sum(1 for b in pozisyonlar.values() if b.has_open_position)
+    return satilan, kalan
+
+
+def telegram_komutunu_uygula(komut: str, kasa: "MerkeziKasa", pozisyonlar: dict, durum_kaydet, rapor,
+                             acik_pozisyon_sayaci: Optional[list], kontrol: dict) -> None:
+    """Ana thread'de calisir (alim-satim ile ayni thread - yaris durumu olmaz)."""
+    global _alim_durumu
+    if komut == "/durum":
+        send_telegram(durum_ozeti_metni(kasa, pozisyonlar))
+    elif komut == "/alimdurdur":
+        _alim_durumu = "DURDURULDU"
+        durum_kaydet()
+        send_telegram("\u23F8 <b>Yeni alimlar durduruldu.</b>\nAcik pozisyonlar stop/kar-al kurallariyla "
+                      "yonetilmeye devam ediyor. Tekrar acmak icin /devam")
+    elif komut == "/devam":
+        _alim_durumu = "ACIK"
+        durum_kaydet()
+        send_telegram("\u25B6\uFE0F <b>Yeni alimlar acildi.</b>")
+    elif komut == "/bosalt":
+        _alim_durumu = "BOSALTMA"
+        durum_kaydet()
+        acik = sum(1 for b in pozisyonlar.values() if b.has_open_position)
+        send_telegram(f"\U0001F9F9 <b>Bosaltma modu acildi.</b>\nYeni alim yapilmayacak; {acik} acik pozisyon "
+                      f"kendi kurallariyla kapaninca bot duracak. Iptal icin /devam")
+    elif komut == "/hepsinisat":
+        acik = sum(1 for b in pozisyonlar.values() if b.has_open_position)
+        if not acik:
+            send_telegram("Acik pozisyon yok, satilacak bir sey yok.")
+            return
+        kontrol["hepsini_sat_bitis"] = time.monotonic() + HEPSINI_SAT_ONAY_SANIYE
+        send_telegram(f"\u26a0\ufe0f <b>{acik} acik pozisyonun TAMAMI piyasa fiyatindan satilacak.</b>\n"
+                      f"Onaylamak icin {HEPSINI_SAT_ONAY_SANIYE} saniye icinde /onayla gonderin.")
+    elif komut == "/onayla":
+        if time.monotonic() > kontrol.get("hepsini_sat_bitis", 0.0):
+            send_telegram("Onaylanacak bir islem yok (once /hepsinisat gonderin; onay suresi "
+                          f"{HEPSINI_SAT_ONAY_SANIYE} sn).")
+            return
+        kontrol["hepsini_sat_bitis"] = 0.0
+        _alim_durumu = "DURDURULDU"  # satistan hemen sonra yeniden alim yapilmasin
+        satilan, kalan = tum_pozisyonlari_kapat(pozisyonlar, kasa, durum_kaydet, rapor,
+                                                acik_pozisyon_sayaci, "MANUEL-KAPANIS")
+        durum_kaydet()
+        mesaj = (f"\u2705 <b>{satilan} pozisyon satildi.</b>\nYeni alimlar DURDURULDU "
+                 f"(acmak icin /devam).")
+        if kalan:
+            mesaj += f"\n\u26a0\ufe0f Satilamayan: {html.escape(', '.join(kalan))} - bot tekrar deneyecek."
+        send_telegram(mesaj)
+    elif komut in ("/yardim", "/help", "/start"):
+        send_telegram(TELEGRAM_YARDIM_METNI)
+    else:
+        send_telegram(f"Bilinmeyen komut: {html.escape(komut)}\n\n{TELEGRAM_YARDIM_METNI}")
+
+
+_telegram_komut_kuyrugu: "queue.Queue[str]" = queue.Queue()
+_telegram_dinleyici_baslatildi = False
+
+
+def _telegram_guncellemeleri_al(offset: Optional[int], bekleme_saniye: int) -> list:
+    parametreler = {"timeout": bekleme_saniye, "allowed_updates": '["message"]'}
+    if offset is not None:
+        parametreler["offset"] = offset
+    url = (f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?"
+           f"{urllib.parse.urlencode(parametreler)}")
+    req = urllib.request.Request(url, headers={"User-Agent": "project-aurelius-bot"})
+    with urllib.request.urlopen(req, timeout=bekleme_saniye + 15) as resp:
+        veri = json.loads(resp.read().decode())
+    return veri.get("result", []) if isinstance(veri, dict) and veri.get("ok") else []
+
+
+def _telegram_komut_dinleyici() -> None:
+    """Arka plan thread'i: sadece komutlari kuyruga ekler, islem YAPMAZ. Bot
+    kapaliyken gonderilmis eski mesajlar (orn. unutulmus bir /hepsinisat) atlanir."""
+    offset = None
+    while offset is None:
+        try:
+            eski = _telegram_guncellemeleri_al(-1, 0)
+            offset = eski[-1]["update_id"] + 1 if eski else 0
+        except Exception as e:
+            logger.warning("Telegram komut dinleyici baslatilamadi, tekrar denenecek: %s", e)
+            time.sleep(15)
+    while True:
+        try:
+            for guncelleme in _telegram_guncellemeleri_al(offset, 25):
+                offset = guncelleme["update_id"] + 1
+                mesaj = guncelleme.get("message") or {}
+                if str(mesaj.get("chat", {}).get("id")) != str(TELEGRAM_CHAT_ID):
+                    logger.warning("Yetkisiz sohbetten gelen Telegram mesaji yok sayildi: %s",
+                                   mesaj.get("chat", {}).get("id"))
+                    continue
+                metin = (mesaj.get("text") or "").strip()
+                if metin.startswith("/"):
+                    _telegram_komut_kuyrugu.put(metin.split()[0].split("@")[0].lower())
+        except Exception as e:
+            logger.warning("Telegram komutlari alinamadi: %s", e)
+            time.sleep(10)
+
+
+def telegram_komut_dinleyicisini_baslat() -> bool:
+    global _telegram_dinleyici_baslatildi
+    if not (TELEGRAM_KOMUTLARI_AKTIF and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return False
+    if not _telegram_dinleyici_baslatildi:
+        threading.Thread(target=_telegram_komut_dinleyici, daemon=True, name="telegram-komut").start()
+        _telegram_dinleyici_baslatildi = True
+    return True
+
+
+def bekleyen_telegram_komutlari() -> list:
+    komutlar = []
+    while True:
+        try:
+            komutlar.append(_telegram_komut_kuyrugu.get_nowait())
+        except queue.Empty:
+            return komutlar
+
+
+def _saglik_pingi_gonder(ek: str = "", bekle: bool = False) -> None:
+    """Dis saglik servisine (AURELIUS_SAGLIK_URL) 'hala calisiyorum' sinyali gonderir.
+    Sinyal kesilirse servis size haber verir (bilgisayar kapansa bile)."""
+    if not SAGLIK_PING_URL:
+        return
+
+    def gonder():
+        try:
+            req = urllib.request.Request(SAGLIK_PING_URL.rstrip("/") + ek,
+                                         headers={"User-Agent": "project-aurelius-bot"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+        except Exception as e:
+            logger.warning("Saglik pingi gonderilemedi: %s", e)
+
+    if bekle:
+        gonder()
+    else:
+        threading.Thread(target=gonder, daemon=True, name="saglik-pingi").start()
+
+
+def _dongu_beklemesi(komut_isleyici) -> None:
+    """Turlar arasi bekleme. Telegram komutlari aciksa bekleme boyunca her saniye
+    komutlara bakilir (yanit ~1 sn icinde gelir)."""
+    if komut_isleyici is None:
+        time.sleep(REAL_POLL_INTERVAL_SECONDS)
+        return
+    bitis = time.monotonic() + REAL_POLL_INTERVAL_SECONDS
+    while True:
+        komut_isleyici()
+        kalan = bitis - time.monotonic()
+        if kalan <= 0:
+            return
+        time.sleep(min(1.0, kalan))
+
+
+def _kapanista_pozisyon_sorusu() -> str:
+    """Ctrl+C sonrasi acik pozisyonlar icin secim ister. Etkilesimli konsol yoksa
+    veya cevap alinamazsa guvenli varsayilan 'H' (oldugu gibi birak)."""
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return "H"
+    except Exception:
+        return "H"
+    print(f"{YELLOW}{BOLD}  Acik pozisyonlar ne yapilsin?{RESET}")
+    print(f"{YELLOW}    [H] Oldugu gibi birak - bot kapaliyken stop/kar-al CALISMAZ (varsayilan){RESET}")
+    print(f"{YELLOW}    [S] Hepsini SIMDI piyasa fiyatindan sat{RESET}")
+    try:
+        cevap = input("  Seciminiz (H/S) ve Enter: ")
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return "H"
+    return "S" if cevap.strip().upper() in ("S", "SAT") else "H"
+
+
+def _bat_degeri(deger: str) -> str:
+    return deger.replace("%", "%%").replace('"', "")
+
+
+def baslatici_olustur() -> int:
+    """'python project_aurelius_bot_v18.py kurulum': bu penceredeki ayarlarla, bot
+    cokerse/koparsa 60 sn sonra kendini yeniden baslatan baslatici dosyayi olusturur
+    ve (Windows'ta, istege bagli) oturum acilinca otomatik baslatir."""
+    gerekli = ["BINANCE_TR_API_KEY", "BINANCE_TR_SECRET_KEY", "AURELIUS_LIVE_CONFIRM", "AURELIUS_CANLI_MOD"]
+    istege_bagli = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "AURELIUS_SAGLIK_URL",
+                    "AURELIUS_DURUM_BILDIRIM_SAAT", "AURELIUS_TELEGRAM_KOMUT", "AURELIUS_BORSA_STOP"]
+    eksik = [isim for isim in gerekli if not _ortam_degiskeni_str_oku(isim)]
+    if eksik:
+        print(f"{RED}  HATA: Once bu pencerede su degiskenleri tanimlayin: {', '.join(eksik)}{RESET}")
+        return CIKIS_AYAR_HATASI
+    degerler = [(isim, _ortam_degiskeni_str_oku(isim)) for isim in gerekli + istege_bagli
+                if _ortam_degiskeni_str_oku(isim)]
+    betik = os.path.abspath(__file__)
+    python = sys.executable or "python"
+
+    if os.name == "nt":
+        dosya = os.path.join(_SCRIPT_DIR, "baslat.bat")
+        satirlar = ["@echo off", "title Project Aurelius", f'cd /d "{_SCRIPT_DIR}"']
+        satirlar += [f'set "{isim}={_bat_degeri(deger)}"' for isim, deger in degerler]
+        satirlar += [
+            ":dongu",
+            f'"{python}" "{betik}"',
+            "set KOD=%ERRORLEVEL%",
+            f'if "%KOD%"=="{CIKIS_DUR}" goto son',
+            f'if "%KOD%"=="{CIKIS_AYAR_HATASI}" goto son',
+            "echo.",
+            "echo [%date% %time%] Bot beklenmedik sekilde kapandi (kod %KOD%). 60 sn sonra yeniden "
+            "baslatilacak - iptal icin Ctrl+C.",
+            "timeout /t 60 /nobreak >nul",
+            "goto dongu",
+            ":son",
+            "echo.",
+            "echo Bot durdu (kod %KOD%), yeniden baslatilmayacak.",
+            "pause",
+        ]
+    else:
+        dosya = os.path.join(_SCRIPT_DIR, "baslat.sh")
+        satirlar = ["#!/usr/bin/env bash", f"cd '{_SCRIPT_DIR}'"]
+        satirlar += [f"export {isim}='" + deger.replace("'", "'\\''") + "'" for isim, deger in degerler]
+        satirlar += [
+            "while true; do",
+            f"  '{python}' '{betik}'",
+            "  KOD=$?",
+            f"  if [ $KOD -eq {CIKIS_DUR} ] || [ $KOD -eq {CIKIS_AYAR_HATASI} ]; then",
+            "    echo \"Bot durdu (kod $KOD), yeniden baslatilmayacak.\"; break",
+            "  fi",
+            "  echo \"Bot beklenmedik sekilde kapandi (kod $KOD). 60 sn sonra yeniden baslatilacak (iptal: Ctrl+C).\"",
+            "  sleep 60",
+            "done",
+        ]
+    with open(dosya, "w", encoding="utf-8", newline="\r\n" if os.name == "nt" else "\n") as f:
+        f.write("\n".join(satirlar) + "\n")
+    if os.name != "nt":
+        os.chmod(dosya, 0o700)
+    print(f"{GREEN}  Baslatici olusturuldu: {dosya}{RESET}")
+    print(f"{GRAY}  Icine yazilan ayarlar: {', '.join(isim for isim, _ in degerler)}{RESET}")
+    print(f"{YELLOW}  UYARI: Bu dosya API anahtarlarinizi icerir - kimseyle paylasmayin.{RESET}")
+    print(f"{GRAY}  Bot cokerse veya internet/bakiye sorunuyla baslayamazsa 60 sn sonra kendini yeniden "
+          f"baslatir; Ctrl+C, bosaltma veya ACIL FREN ile durunca yeniden baslatmaz.{RESET}")
+
+    if os.name == "nt" and os.environ.get("APPDATA"):
+        try:
+            cevap = input("  Windows oturumu acilinca bot otomatik baslasin mi? (E/H): ")
+        except (KeyboardInterrupt, EOFError):
+            cevap = "H"
+        baslangic = os.path.join(os.environ["APPDATA"], "Microsoft", "Windows", "Start Menu",
+                                 "Programs", "Startup", "Aurelius_otomatik_baslat.bat")
+        if cevap.strip().upper() in ("E", "EVET"):
+            with open(baslangic, "w", encoding="utf-8", newline="\r\n") as f:
+                f.write(f'@echo off\nstart "Project Aurelius" "{dosya}"\n')
+            print(f"{GREEN}  Otomatik baslatma eklendi: {baslangic}{RESET}")
+            print(f"{GRAY}  Kaldirmak icin bu dosyayi silin. Elektrik kesintisinden sonra bilgisayarin "
+                  f"acilip oturumun acilmasi gerekir.{RESET}")
+        elif os.path.exists(baslangic):
+            print(f"{GRAY}  Onceden eklenmis otomatik baslatma duruyor: {baslangic}{RESET}")
+    print(f"{CYAN}  Botu baslatmak icin: {os.path.basename(dosya)} dosyasini calistirin.{RESET}")
+    return CIKIS_DUR
+
+
 def run_simulation():
+    global _alim_durumu
     print_banner()
 
     if CANLI_MOD and not canli_mod_on_kontrol():
         print(f"{RED}Bot baslatilamadi (CANLI_MOD guvenlik kontrolu basarisiz).{RESET}")
-        return
+        return CIKIS_AYAR_HATASI
 
     print(f"[{ts()}] Binance TR piyasasi taraniyor, TRY paritesi olan coinler bulunuyor...")
     try:
         semboller = try_paritelerini_bul()
     except Exception as e:
         print(f"{RED}Piyasa taranamadi: {e}{RESET}")
-        return
+        return CIKIS_YENIDEN_DENE
 
     if not semboller:
         print(f"{RED}Hicbir TRY paritesi bulunamadi, bot baslatilamiyor.{RESET}")
-        return
+        return CIKIS_YENIDEN_DENE
 
     print(f"[{ts()}] Toplam {len(semboller)} TRY paritesi bulundu.\n")
 
@@ -3427,7 +4130,7 @@ def run_simulation():
         watchlist, hacim_map, durum_map, bilgi_map = coin_degerlendir_ve_sec(semboller, MAX_WATCHLIST)
     except Exception as e:
         print(f"{RED}Coin degerlendirmesi yapilamadi: {e}{RESET}")
-        return
+        return CIKIS_YENIDEN_DENE
 
     if not watchlist:
         print(f"{YELLOW}  Su an kriterlere uyan hicbir coin yok. Bot %100 nakitte bekleyecek "
@@ -3438,7 +4141,7 @@ def run_simulation():
         kayitli_durum = durumu_yukle()
     except CanliDurumKorumasi as e:
         print(f"{RED}{BOLD}  {e}{RESET}")
-        return
+        return CIKIS_AYAR_HATASI
     if kayitli_durum:
         kasa, pozisyonlar, acik_baslangic_sayisi = durumdan_kasa_ve_pozisyonlar_olustur(kayitli_durum)
         acik_pozisyon_sayaci = [acik_baslangic_sayisi]
@@ -3449,6 +4152,12 @@ def run_simulation():
               f"{kayitli_durum.get('kaydedilme_zamani', '?')}{RESET}")
         print(f"{GREEN}  X raporu son: {rapor.son_x_raporu_zamani.strftime('%d.%m.%Y %H:%M')} | "
               f"Z raporu son: {rapor.son_z_raporu_zamani.strftime('%d.%m.%Y %H:%M')}{RESET}\n")
+        _alim_durumu = kayitli_durum.get("alim_durumu", "ACIK")
+        if _alim_durumu not in ALIM_DURUMU_ACIKLAMA:
+            _alim_durumu = "ACIK"
+        if _alim_durumu != "ACIK":
+            print(f"{YELLOW}  Yeni alimlar: {ALIM_DURUMU_ACIKLAMA[_alim_durumu]} - Telegram'dan /devam ile "
+                  f"acabilirsiniz.{RESET}\n")
     else:
         kasa = MerkeziKasa(TOPLAM_SANAL_BAKIYE_TRY)
         pozisyonlar: dict = {}
@@ -3467,11 +4176,16 @@ def run_simulation():
     # sekilde senkronize olur. Tutar 0 (veya negatif/okunamadi) ise kasa
     # SESSIZCE sifirlanmaz - mevcut/kayitli deger korunur ve acikca uyarilir.
     if CANLI_MOD:
+        # v18: Bot kapaliyken borsadaki stop emri dolduysa satisi ONCE kaydet; kasa
+        # hemen asagida borsadaki gercek TRY bakiyesine esitlenir (cift sayim olmaz).
+        for bot in pozisyonlar.values():
+            if any(lvl.has_position and lvl.borsa_stop_emir_id for lvl in bot.grid):
+                bot.borsa_stop_bakimi(kasa, acik_pozisyon_sayaci, rapor, None, zorla_sorgu=True, yeni_kur=False)
         try:
             bakiyeler = binance_hesap_bakiyeleri()
         except Exception as e:
             print(f"{RED}  HATA: Canli bakiye cekilemedi, bot baslatilamiyor: {e}{RESET}")
-            return
+            return CIKIS_YENIDEN_DENE
         bakiye_ozeti_yazdir(bakiyeler)
         gercek_bakiye = bakiyeler.get("TRY", {}).get("free", 0.0)
         print(f"{GREEN}  CANLI MOD AKTIF - borsadan cekilen serbest TRY bakiyesi: {gercek_bakiye:,.2f} TRY{RESET}\n")
@@ -3491,12 +4205,32 @@ def run_simulation():
             rapor = RaporlamaDurumu(kasa.bakiye)  # X/Z tabanlari sanal degil gercek bakiyeden baslasin
         elif any(b.has_open_position for b in pozisyonlar.values()):
             mutabakat_yap(kasa, pozisyonlar)  # bot kapaliyken elle satilan/degisen pozisyonlari hemen yakala
-        send_telegram(f"\U0001F7E2 <b>Project Aurelius CANLI MODDA baslatildi!</b>\nBorsa bakiyesi: {kasa.bakiye:,.2f} TRY")
+        send_telegram(f"\U0001F7E2 <b>Project Aurelius CANLI MODDA baslatildi!</b>\nBorsa bakiyesi: {kasa.bakiye:,.2f} TRY"
+                      f"\nYeni alimlar: {ALIM_DURUMU_ACIKLAMA[_alim_durumu]}"
+                      f"\nBorsa stop emri: {'ACIK' if BORSA_STOP_AKTIF else 'kapali'}"
+                      + ("\nKomutlar icin /yardim" if TELEGRAM_KOMUTLARI_AKTIF else ""))
     else:
         send_telegram(f"\U0001F9EA Project Aurelius SIMULASYON modunda baslatildi. Bakiye: {kasa.bakiye:,.2f} TRY")
 
     def kaydet():
         durumu_kaydet(kasa, pozisyonlar, rapor)
+
+    komut_kontrol: dict = {}
+
+    def komutlari_isle():
+        for komut in bekleyen_telegram_komutlari():
+            print(f"[{ts()}] {CYAN}Telegram komutu: {komut}{RESET}")
+            try:
+                telegram_komutunu_uygula(komut, kasa, pozisyonlar, kaydet, rapor, acik_pozisyon_sayaci,
+                                         komut_kontrol)
+            except Exception as e:
+                logger.error("Telegram komutu islenemedi (%s): %s", komut, e)
+                send_telegram(f"Komut islenemedi ({html.escape(komut)}): {html.escape(str(e))}")
+
+    komut_isleyici = komutlari_isle if telegram_komut_dinleyicisini_baslat() else None
+    son_durum_bildirimi = time.monotonic()
+    son_saglik_pingi = time.monotonic()
+    _saglik_pingi_gonder()
 
     real_poll_count = 0
     izin_verilen_pozisyon = 0  # v14: guvenli varsayilan (ilk tick'ten once bir kesinti olursa)
@@ -3522,11 +4256,15 @@ def run_simulation():
             # Sayac tick icinde canli guncellenir, ama basarisiz tasfiye / mutabakat
             # ile kapatilan pozisyonlar gibi yollarla kayabilir; her tick gercekten
             # yeniden kur.
+            if komut_isleyici is not None:
+                komut_isleyici()
             acik_pozisyon_sayaci[0] = sum(1 for b in pozisyonlar.values() if b.has_open_position)
             guncel_bakiye = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
             izin_verilen_pozisyon, hedef_pozisyon_tutari, sniper_modu_aktif = dinamik_pozisyon_planla(
                 kasa.bakiye, guncel_bakiye, btc_degisim
             )  # v17: kasaya gore adaptif Sniper Modu / kademeli portfoy modeli
+            if _alim_durumu != "ACIK":
+                izin_verilen_pozisyon = 0  # v18: /alimdurdur veya /bosalt - sadece yonetim, yeni alim yok
             en_kaliteli_aday = en_kaliteli_aday_belirle(bilgi_map, pozisyonlar)  # v17 MODUL 1.2
 
             ilgilenilecek_semboller = sorted(set(pozisyonlar.keys()) | set(watchlist))
@@ -3589,6 +4327,7 @@ def run_simulation():
                                      izin_verilen_pozisyon=izin_verilen_pozisyon,
                                      durum_kaydet=kaydet, rapor=rapor, giris_bilgisi=bilgi_map.get(sym),
                                      en_kaliteli_aday=en_kaliteli_aday, sniper_modu=sniper_modu_aktif)
+                bot.borsa_stop_bakimi(kasa, acik_pozisyon_sayaci, rapor, kaydet)  # v18
 
                 time.sleep(API_CALL_SLEEP_SECONDS)
 
@@ -3614,7 +4353,7 @@ def run_simulation():
                     print_trade_history_table(pozisyonlar.values())
                     print_performans_raporu(kasa, pozisyonlar, 0, izin_verilen_pozisyon=0)
                     print(f"{RED}Bot acil fren nedeniyle durduruldu. Ayarlardan MAX_DRAWDOWN_PCT degistirilebilir.{RESET}")
-                    return
+                    return CIKIS_DUR
 
             if real_poll_count % scan_araligi_tur == 0:
                 try:
@@ -3658,8 +4397,26 @@ def run_simulation():
                 z_raporu_olustur_ve_gonder(kasa, pozisyonlar, rapor)
                 kaydet()
 
-            if GERCEKCI_MOD:
-                time.sleep(REAL_POLL_INTERVAL_SECONDS)
+            # v18: periyodik "bot calisiyor" bildirimi ve dis saglik pingi
+            simdi = time.monotonic()
+            if SAGLIK_PING_URL and simdi - son_saglik_pingi >= SAGLIK_PING_ARALIGI_SANIYE:
+                son_saglik_pingi = simdi
+                _saglik_pingi_gonder()
+            if DURUM_BILDIRIM_SAAT > 0 and simdi - son_durum_bildirimi >= DURUM_BILDIRIM_SAAT * 3600:
+                son_durum_bildirimi = simdi
+                send_telegram("\U0001F493 " + durum_ozeti_metni(kasa, pozisyonlar))
+
+            # v18: bosaltma modu - acik pozisyon kalmadiysa bilincli olarak dur
+            if _alim_durumu == "BOSALTMA" and not any(b.has_open_position for b in pozisyonlar.values()):
+                _alim_durumu = "ACIK"  # sonraki baslatmada normal islem yapilsin
+                print(f"\n{GREEN}{BOLD}  BOSALTMA TAMAMLANDI: acik pozisyon kalmadi, bot durduruluyor.{RESET}\n")
+                send_telegram("\U0001F9F9 <b>Bosaltma tamamlandi.</b> Acik pozisyon kalmadi, bot durduruldu. "
+                              f"Nakit: {kasa.bakiye:,.2f} TRY")
+                return CIKIS_DUR
+
+            # CANLI modda asla simule fiyatla islem yapilmaz (GERCEKCI_MOD kapatilsa bile)
+            if GERCEKCI_MOD or CANLI_MOD:
+                _dongu_beklemesi(komut_isleyici)
             else:
                 for _ in range(SUB_TICKS_PER_REAL_POLL):
                     time.sleep(SUB_TICK_SECONDS)
@@ -3667,6 +4424,8 @@ def run_simulation():
                     izin_verilen_sim, hedef_sim, sniper_sim = dinamik_pozisyon_planla(
                         kasa.bakiye, guncel_bakiye_sim, btc_degisim
                     )
+                    if _alim_durumu != "ACIK":
+                        izin_verilen_sim = 0
                     en_kaliteli_aday_sim = en_kaliteli_aday_belirle(bilgi_map, pozisyonlar)  # v17 MODUL 1.2
                     for bot in pozisyonlar.values():
                         if not bot.initialized or bot.bekliyor:
@@ -3682,16 +4441,32 @@ def run_simulation():
                                              en_kaliteli_aday=en_kaliteli_aday_sim, sniper_modu=sniper_sim)
 
     except KeyboardInterrupt:
-        print(f"\n{YELLOW}--- Simulasyon durduruldu (Ctrl+C) ---{RESET}\n")
+        print(f"\n{YELLOW}--- Bot durduruldu (Ctrl+C) ---{RESET}\n")
         print_trade_history_table(pozisyonlar.values())
         print_performans_raporu(kasa, pozisyonlar, acik_pozisyon_sayaci[0],
                                  izin_verilen_pozisyon=izin_verilen_pozisyon)
+        acik_botlar = [b for b in pozisyonlar.values() if b.has_open_position]
+        if CANLI_MOD and acik_botlar:
+            korunan = [b.symbol for b in acik_botlar if any(l.borsa_stop_emir_id for l in b.grid)]
+            if korunan:
+                print(f"{GRAY}  Borsa stop emri olanlar bot kapaliyken de korunur: {', '.join(korunan)}{RESET}")
+            if _kapanista_pozisyon_sorusu() == "S":
+                satilan, kalan = tum_pozisyonlari_kapat(pozisyonlar, kasa, None, rapor,
+                                                        acik_pozisyon_sayaci, "MANUEL-KAPANIS")
+                print(f"{GREEN}  {satilan} pozisyon satildi.{RESET}" + (
+                    f" {RED}Satilamayan: {', '.join(kalan)} - Binance TR'de kontrol edin!{RESET}" if kalan else ""))
+            else:
+                print(f"{YELLOW}  Pozisyonlar oldugu gibi birakildi; bot tekrar baslatilinca yonetmeye devam eder.{RESET}")
         send_telegram(f"\U0001F6D1 Project Aurelius durduruldu (Ctrl+C). Guncel bakiye: "
-                      f"{v9_toplam_portfoy_degeri(kasa, pozisyonlar):,.2f} TRY")
+                      f"{v9_toplam_portfoy_degeri(kasa, pozisyonlar):,.2f} TRY"
+                      + (f"\nAcik pozisyon: {sum(1 for b in pozisyonlar.values() if b.has_open_position)}"
+                         if CANLI_MOD else ""))
         print(f"{YELLOW}Hatirlatma: {'Bu CANLI bir oturumdu.' if CANLI_MOD else 'Bu bir simulasyondu.'}{RESET}")
+        return CIKIS_DUR
     except Exception as e:
         print(f"\n{RED}{BOLD}KRITIK HATA: {e}{RESET}\n")
         send_telegram(f"\U0001F6A8 Project Aurelius KRITIK HATA ile durdu: {html.escape(str(e))}")
+        _saglik_pingi_gonder("/fail", bekle=True)
         raise
     finally:
         durumu_kaydet(kasa, pozisyonlar, rapor)
@@ -3715,7 +4490,7 @@ def backtest_calistir(symbol: str, gun: int, sermaye: float = None):
     sermaye = sermaye if sermaye is not None else TOPLAM_SANAL_BAKIYE_TRY
 
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - BACKTEST MODU (v17)'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - BACKTEST MODU (v18)'.center(74)}{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
     print(f"  Sembol: {symbol}   |   Test edilen sure: son {gun} gun (1 saatlik mumlarla)   |   Sermaye: {sermaye:,.2f} TRY\n")
     print(f"{YELLOW}  NOT: Backtest, ORIJINAL coklu-seviye grid davranisini kullanir "
@@ -3785,15 +4560,25 @@ def backtest_calistir(symbol: str, gun: int, sermaye: float = None):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1].lower() == "backtest":
-        symbol = sys.argv[2].upper() if len(sys.argv) > 2 else "BTCTRY"
-        gun = int(sys.argv[3]) if len(sys.argv) > 3 else 30
-        sermaye = float(sys.argv[4]) if len(sys.argv) > 4 else None
-        backtest_calistir(symbol, gun, sermaye)
-    elif len(sys.argv) > 1 and sys.argv[1].lower() == "baglanti":
-        baglanti_testi()
-    else:
-        run_simulation()
+    komut = sys.argv[1].lower() if len(sys.argv) > 1 else ""
+    try:
+        if komut == "backtest":
+            symbol = sys.argv[2].upper() if len(sys.argv) > 2 else "BTCTRY"
+            gun = int(sys.argv[3]) if len(sys.argv) > 3 else 30
+            sermaye = float(sys.argv[4]) if len(sys.argv) > 4 else None
+            backtest_calistir(symbol, gun, sermaye)
+            kod = CIKIS_DUR
+        elif komut == "baglanti":
+            baglanti_testi()
+            kod = CIKIS_DUR
+        elif komut == "kurulum":
+            kod = baslatici_olustur()
+        else:
+            kod = run_simulation()
+    except KeyboardInterrupt:
+        kod = CIKIS_DUR  # baslangic sirasinda Ctrl+C: baslatici yeniden baslatmasin
+    # v18: cikis kodu baslaticiya (baslat.bat/.sh) yeniden baslatip baslatmayacagini soyler
+    sys.exit(kod if isinstance(kod, int) else CIKIS_DUR)
 
 
 if __name__ == "__main__":

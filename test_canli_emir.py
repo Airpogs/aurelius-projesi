@@ -1,7 +1,7 @@
 """
 PROJECT AURELIUS - TEK SEFERLIK CANLI TEST EMRI SCRIPTI
 ========================================================
-Amac: project_aurelius_bot_v17.py icindeki Binance TR CANLI MOD
+Amac: project_aurelius_bot_v18.py icindeki Binance TR CANLI MOD
 fonksiyonlarini (binance_serbest_try_bakiyesi, sembol_filtrelerini_getir,
 binance_gercek_emir_gonder) kullanarak, TAM BOT DONGUSUNU ACMADAN, TEK ve
 KUCUK bir test MARKET ALIM emri gonderip ORDER_ENDPOINT_PATH ile side/type
@@ -47,27 +47,27 @@ import sys
 MAKS_TEST_TUTARI_TRY = 50.0  # bu tutarin USTUNDE bir test emrine ASLA izin verilmez
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-BOT_DOSYA_YOLU = os.path.join(_SCRIPT_DIR, "project_aurelius_bot_v17.py")
+BOT_DOSYA_YOLU = os.path.join(_SCRIPT_DIR, "project_aurelius_bot_v18.py")
 
 
 def _bot_dosyasini_bul():
     """
     Bot dosyasini bu scriptin klasorunde arar. Windows ayni adli ikinci
-    indirmeyi 'project_aurelius_bot_v17 (1).py' diye kaydeder; tek bir
+    indirmeyi 'project_aurelius_bot_v18 (1).py' diye kaydeder; tek bir
     boyle aday varsa onu kullanir. Bulamazsa klasordeki .py dosyalarini
     listeleyip neyin yanlis oldugunu soyler.
     """
     if os.path.exists(BOT_DOSYA_YOLU):
         return BOT_DOSYA_YOLU
-    adaylar = sorted(glob.glob(os.path.join(_SCRIPT_DIR, "project_aurelius_bot_v17*.py")))
+    adaylar = sorted(glob.glob(os.path.join(_SCRIPT_DIR, "project_aurelius_bot_v18*.py")))
     if len(adaylar) == 1:
         print(f"NOT: '{os.path.basename(adaylar[0])}' kullaniliyor "
-              f"(adi tam olarak project_aurelius_bot_v17.py degil).")
+              f"(adi tam olarak project_aurelius_bot_v18.py degil).")
         return adaylar[0]
 
-    print(f"HATA: '{_SCRIPT_DIR}' klasorunde project_aurelius_bot_v17.py bulunamadi.")
+    print(f"HATA: '{_SCRIPT_DIR}' klasorunde project_aurelius_bot_v18.py bulunamadi.")
     if adaylar:
-        print("Birden fazla kopya var - GUNCEL olani 'project_aurelius_bot_v17.py' olarak "
+        print("Birden fazla kopya var - GUNCEL olani 'project_aurelius_bot_v18.py' olarak "
               "yeniden adlandirip digerlerini silin:")
         for aday in adaylar:
             print(f"    {os.path.basename(aday)}")
@@ -75,7 +75,7 @@ def _bot_dosyasini_bul():
         py_dosyalari = sorted(f for f in os.listdir(_SCRIPT_DIR) if ".py" in f.lower())
         print(f"Bu klasordeki Python dosyalari: {', '.join(py_dosyalari) or '(hic yok)'}")
         print("Bot dosyasini bu klasore indirin ve adinin tam olarak "
-              "'project_aurelius_bot_v17.py' oldugundan emin olun.")
+              "'project_aurelius_bot_v18.py' oldugundan emin olun.")
     sys.exit(1)
 
 
