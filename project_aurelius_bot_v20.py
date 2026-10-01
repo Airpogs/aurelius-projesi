@@ -3228,8 +3228,10 @@ class CoinBot:
         gb = self.giris_bilgi or {}
         simdi = datetime.now()
         toplam = self.acik_islem_pnl - (gb.get("komisyon") or 0.0)  # alim komisyonu da islemin maliyeti
-        tutar = gb.get("tutar") or level.buy_price * (gb.get("miktar") or 0.0)
-        risk_try = (gb.get("miktar") or 0.0) * level.risk_birimi
+        # v19'dan devralinan pozisyonda giris bilgisi yok: alim tutari starting_try'dan bulunur
+        tutar = gb.get("tutar") or self.starting_try or 0.0
+        miktar = gb.get("miktar") or (tutar / level.buy_price if level.buy_price else 0.0)
+        risk_try = miktar * level.risk_birimi
         kayit = islem_kaydi_olustur(
             self.symbol, _aktif_calisma_modu(), _tarih_oku(gb.get("zaman")), simdi, level.buy_price, cikis_fiyati,
             tutar, toplam, risk_try, level.risk_birimi / level.buy_price if level.buy_price else 0.0, tag,
@@ -3524,7 +3526,9 @@ class CoinBot:
 
                 # v20: pozisyon, stop olursa kayip portfoyun RISK_PCT'si olacak buyuklukte
                 portfoy = portfoy_degeri if portfoy_degeri is not None else kasa.bakiye
-                yatirim_tutari = risk_bazli_tutar(portfoy, giris_stop_pct(price, derin, giris_bilgisi),
+                # (giris fiyati kayma ile biraz yukarida olabilir; stop mesafesi en kotu kaymayla hesaplanir)
+                yatirim_tutari = risk_bazli_tutar(portfoy,
+                                                  giris_stop_pct(price * (1 + SLIPAJ_MAKS_PCT), derin, giris_bilgisi),
                                                   min(hedef_pozisyon_tutari, kasa.bakiye / (1 + KOMISYON_PCT)))
                 if yatirim_tutari <= 0:
                     continue
@@ -5913,7 +5917,7 @@ def backtest_simule_et(coin_verileri: dict, btc_verisi: Optional[dict], bas_ms: 
             continue
         a = max(adaylar, key=lambda x: x["skor"])
         sembol, fiyat = a["symbol"], son_fiyat[a["symbol"]]
-        tutar = risk_bazli_tutar(deger, giris_stop_pct(fiyat, a, None),
+        tutar = risk_bazli_tutar(deger, giris_stop_pct(fiyat * (1 + BACKTEST_SLIPAJ_PCT), a, None),
                                  min(hedef_tutar, nakit / (1 + KOMISYON_PCT)))
         if tutar <= 0 or tutar > nakit:
             continue
