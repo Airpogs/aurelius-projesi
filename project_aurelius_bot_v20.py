@@ -1,7 +1,26 @@
 """
-PROJECT AURELIUS - v19
+PROJECT AURELIUS - v20
 Binance TR AKILLI SECIM Grid Trading Bot - PIYASA ADAPTIF MOTOR VE OTONOM SERMAYE DONGUSU
 ======================================================================
+v20 - RISK KORUMASI, ISLEM GUNLUGU VE GECMIS VERI TESTI:
+  1) Islem basina risk: pozisyon, stop olursa kaybin portfoyun en fazla
+     AURELIUS_RISK_PCT'si (varsayilan %1) olacagi buyuklukte acilir (eskiden
+     neredeyse tum kasa). 0 = kapali (eski davranis).
+  2) Gunluk zarar limiti: portfoy gun basindan AURELIUS_GUNLUK_ZARAR_PCT
+     (varsayilan %3) duserse o gun yeni alim yok. Art arda AURELIUS_KAYIP_SERISI
+     (varsayilan 3) zararli islemden sonra 12 saat mola. Stop olan coine 24
+     saat, 7 gunde 2 kez zarar ettiren coine 72 saat girilmez.
+  3) Kalici sermaye tabani: acil fren artik her acilista sifirlanmiyor;
+     portfoyun ulastigi en yuksek degerden %20 dusus olcer. Rapordaki
+     baslangic sermayesi AURELIUS_BASLANGIC_SERMAYE ile verilebilir (yoksa
+     v20'nin ilk acilisindaki portfoy). Bot calisirken yatirilan/cekilen TRY
+     mutabakatta algilanir, kar/zarar sayilmaz.
+  4) Islem gunlugu: her kapanan islem project_aurelius_islem_gunlugu.csv'ye
+     (puan, BTC rejimi, R sonucu, cikis sebebi...) yazilir. 'rapor' komutu ve
+     Telegram /rapor ozet verir.
+  5) Gecmis veri testi: 'backtest [GUN] [SERMAYE] [SEMBOLLER]' v20 kurallarini
+     (detayli analiz, R cikislari, risk korumasi, komisyon/kayma) gecmis
+     mumlarda calistirir ve rapor verir. Emir gondermez, anahtar gerektirmez.
 v19 - DETAYLI ANALIZ VE R TABANLI KAR ALMA:
   GIRIS: Bot bir coine girmeden once onu gunluk, 4 saatlik, 1 saatlik ve 15
   dakikalik mumlarla (her birinde ~200 kapanmis mum) inceler:
@@ -26,7 +45,7 @@ v18 - KESINTI ONLEMLERI (bot kapaliyken pozisyonlar korumasiz kalmasin):
      saatte bir Telegram'a portfoy ozeti. AURELIUS_SAGLIK_URL verilirse
      (orn. healthchecks.io ping adresi) 5 dk'da bir "calisiyorum" sinyali;
      sinyal kesilirse (elektrik kesintisi dahil) o servis size haber verir.
-  2) Otomatik yeniden baslatma: 'python project_aurelius_bot_v19.py kurulum'
+  2) Otomatik yeniden baslatma: 'python project_aurelius_bot_v20.py kurulum'
      bu penceredeki ayarlarla baslat.bat (Linux: baslat.sh) olusturur; bot
      coker/baslayamazsa 60 sn sonra yeniden baslar. Istege bagli: Windows
      oturumu acilinca otomatik baslatma. Cikis kodlari: 0 bilincli durdurma,
@@ -482,9 +501,10 @@ YAPMAZ; her emir tek seferde MARKET emri olarak gonderilir ve sonucu
 dogrudan API yanitindan okunur.
 
 Kullanim:
-    python project_aurelius_bot_v19.py                          (canli/simulasyon - CANLI_MOD bayragina gore)
-    python project_aurelius_bot_v19.py backtest SEMBOL GUN [SERMAYE]  (backtest - her zaman simulasyon; ESKI v8/v9 grid mantigi)
-    python project_aurelius_bot_v19.py analiz [SEMBOL]          (detayli analiz raporu, emir gondermez)
+    python project_aurelius_bot_v20.py                          (canli/simulasyon - CANLI_MOD bayragina gore)
+    python project_aurelius_bot_v20.py backtest [GUN] [SERMAYE] [SEMBOLLER]  (gecmis veri testi, emir gondermez)
+    python project_aurelius_bot_v20.py analiz [SEMBOL]          (detayli analiz raporu, emir gondermez)
+    python project_aurelius_bot_v20.py rapor                    (islem gunlugu ozeti)
 """
 
 import time
@@ -504,6 +524,7 @@ import sys
 import logging
 import threading
 import queue
+import bisect
 from decimal import Decimal, ROUND_DOWN
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -596,6 +617,8 @@ PORTFOY_CSV = os.path.join(_SCRIPT_DIR, "project_aurelius_portfoy_gecmisi.csv")
 STATE_DOSYASI = os.path.join(_SCRIPT_DIR, "project_aurelius_state.json")  # v10
 Z_RAPORLARI_CSV = os.path.join(_SCRIPT_DIR, "project_aurelius_z_raporlari.csv")  # v11
 LOG_DOSYASI = os.path.join(_SCRIPT_DIR, "project_aurelius.log")  # v13
+ISLEM_GUNLUGU_CSV = os.path.join(_SCRIPT_DIR, "project_aurelius_islem_gunlugu.csv")  # v20
+BACKTEST_ISLEMLERI_CSV = os.path.join(_SCRIPT_DIR, "project_aurelius_backtest_islemleri.csv")  # v20
 
 # v13: Telegram/ag hatalarinin artik SESSIZCE kaybolmamasi icin kalici log dosyasi.
 # Konsoldaki renkli print() ciktisi degismedi - bu, ONA EK, persistent bir kayittir.
@@ -787,6 +810,26 @@ ALIM_DURUMU_ACIKLAMA = {
     "BOSALTMA": "BOSALTMA (yeni alim yok; pozisyonlar kapaninca bot duracak)",
 }
 _alim_durumu = "ACIK"
+
+
+def _aralikta(deger: float, alt: float, ust: float) -> float:
+    return min(max(deger, alt), ust)
+
+
+# v20 RISK KORUMASI (ayrintilar dosya basindaki v20 notunda)
+RISK_PCT = _aralikta(_ortam_sayisi_oku("AURELIUS_RISK_PCT", 1.0), 0.0, 5.0) / 100
+GUNLUK_ZARAR_LIMIT_PCT = _aralikta(_ortam_sayisi_oku("AURELIUS_GUNLUK_ZARAR_PCT", 3.0), 0.0, 50.0) / 100
+KAYIP_SERISI_LIMIT = int(_aralikta(_ortam_sayisi_oku("AURELIUS_KAYIP_SERISI", 3), 0, 20))
+KAYIP_SERISI_MOLA_SAAT = 12.0
+COIN_STOP_ENGEL_SAAT = 24.0          # STOP-LOSS ile kapanan coine bu sure girilmez
+COIN_TEKRAR_KAYIP_SAYISI = 2         # ayni coinde COIN_TEKRAR_KAYIP_GUN icinde bu kadar zarar ->
+COIN_TEKRAR_KAYIP_GUN = 7
+COIN_TEKRAR_ENGEL_SAAT = 72.0        # ... coine bu sure girilmez
+MIN_POZISYON_TUTARI_TRY = 30.0       # risk hesabi bunun altinda bir tutar verirse bu tutar kullanilir
+BASLANGIC_SERMAYE_TRY = max(0.0, _ortam_sayisi_oku("AURELIUS_BASLANGIC_SERMAYE", 0.0))
+SERMAYE_HAREKETI_MIN_TRY = 5.0       # mutabakatta bundan (ve portfoyun %1'inden) buyuk TRY farki
+SERMAYE_HAREKETI_MIN_ORAN = 0.01     # para yatirma/cekme sayilir
+FREN_SIFIRLA = _ortam_degiskeni_str_oku("AURELIUS_FREN_SIFIRLA") == "1"
 
 REAL_POLL_INTERVAL_SECONDS = 25
 SUB_TICK_SECONDS = 2
@@ -1010,6 +1053,310 @@ class RaporlamaDurumu:
 
 
 # ==========================================================================
+# v20 BOLUM 1: RISK KORUMASI (durum dosyasina kaydedilir, yeniden baslatmada
+# sifirlanmaz). Zaman 'simdi' ile verilebilir - gecmis veri testi ayni sinifi kullanir.
+# ==========================================================================
+
+def _tarih_oku(deger) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(deger) if deger else None
+    except (TypeError, ValueError):
+        return None
+
+
+class RiskKorumasi:
+    def __init__(self):
+        self.yatirilan_sermaye = 0.0      # raporlardaki "baslangic sermayesi"
+        self.zirve_portfoy = 0.0          # acil fren bu degerden olan dususu olcer
+        self.gun = ""
+        self.gun_baslangic_portfoy = 0.0
+        self.ardisik_kayip = 0
+        self.mola_bitis: Optional[datetime] = None
+        self.coin_engel: dict = {}        # sembol -> engelin bittigi an
+        self.coin_kayiplari: dict = {}    # sembol -> son COIN_TEKRAR_KAYIP_GUN gundeki zararli kapanislar
+        self.acil_fren_tetiklendi = False
+        # Acilista portfoy zaten zirveden fren limitinden fazla asagidaysa (dusus bot kapaliyken
+        # olmus): otomatik satis yapilmaz, yeni alimlar /frensifirla'ya kadar durur.
+        self.fren_beklemede = False
+
+    def fren_sifirla(self, portfoy: float) -> None:
+        self.zirve_portfoy = portfoy
+        self.fren_beklemede = False
+        self.acil_fren_tetiklendi = False
+
+    def portfoy_guncelle(self, portfoy: float, simdi: Optional[datetime] = None) -> None:
+        gun = (simdi or datetime.now()).strftime("%Y-%m-%d")
+        if gun != self.gun or self.gun_baslangic_portfoy <= 0:
+            self.gun, self.gun_baslangic_portfoy = gun, portfoy
+        if portfoy > self.zirve_portfoy:
+            self.zirve_portfoy = portfoy
+
+    def zirveden_dusus(self, portfoy: float) -> float:
+        if self.zirve_portfoy <= 0:
+            return 0.0
+        return max(0.0, (self.zirve_portfoy - portfoy) / self.zirve_portfoy)
+
+    def gunluk_degisim(self, portfoy: float) -> float:
+        return portfoy / self.gun_baslangic_portfoy - 1 if self.gun_baslangic_portfoy > 0 else 0.0
+
+    def yeni_alim_engeli(self, portfoy: float, simdi: Optional[datetime] = None) -> Optional[tuple]:
+        """Yeni alim yapilmamasi gerekiyorsa (kod, aciklama), yoksa None."""
+        simdi = simdi or datetime.now()
+        if self.fren_beklemede:
+            return ("FREN", f"portfoy kayitli en yuksek degerinden ({self.zirve_portfoy:,.2f} TRY) "
+                            f"%{self.zirveden_dusus(portfoy) * 100:.0f} asagida; devam icin /frensifirla")
+        if GUNLUK_ZARAR_LIMIT_PCT > 0 and self.gunluk_degisim(portfoy) <= -GUNLUK_ZARAR_LIMIT_PCT:
+            return ("GUNLUK", f"gunluk zarar limiti doldu (portfoy bugun %{self.gunluk_degisim(portfoy) * 100:.1f}, "
+                              f"limit -%{GUNLUK_ZARAR_LIMIT_PCT * 100:g}); yeni alimlar yarin acilacak")
+        if self.mola_bitis is not None and simdi < self.mola_bitis:
+            return ("MOLA", f"art arda zararli islemler - yeni alimlara mola "
+                            f"({self.mola_bitis.strftime('%d.%m %H:%M')}'e kadar)")
+        return None
+
+    def coin_engel_bitisi(self, sembol: str, simdi: Optional[datetime] = None) -> Optional[datetime]:
+        bitis = self.coin_engel.get(sembol)
+        return bitis if bitis is not None and (simdi or datetime.now()) < bitis else None
+
+    def islem_kapandi(self, sembol: str, net_kar: float, etiket: str,
+                      simdi: Optional[datetime] = None) -> list:
+        """Tamamen kapanan islemi isler; kullaniciya gosterilecek mesajlari dondurur."""
+        simdi = simdi or datetime.now()
+        if net_kar >= 0:
+            self.ardisik_kayip = 0
+            return []
+        mesajlar = []
+        self.ardisik_kayip += 1
+        sinir = simdi - timedelta(days=COIN_TEKRAR_KAYIP_GUN)
+        kayiplar = [t for t in self.coin_kayiplari.get(sembol, []) if t > sinir] + [simdi]
+        self.coin_kayiplari[sembol] = kayiplar
+        engel_saat, sebep = 0.0, ""
+        if len(kayiplar) >= COIN_TEKRAR_KAYIP_SAYISI:
+            engel_saat, sebep = COIN_TEKRAR_ENGEL_SAAT, f"son {COIN_TEKRAR_KAYIP_GUN} gunde {len(kayiplar)}. zarar"
+        elif etiket in ("STOP-LOSS", "BORSA-STOP"):
+            engel_saat, sebep = COIN_STOP_ENGEL_SAAT, "stop-loss ile kapandi"
+        if engel_saat > 0:
+            bitis = simdi + timedelta(hours=engel_saat)
+            if bitis > self.coin_engel.get(sembol, simdi):
+                self.coin_engel[sembol] = bitis
+                mesajlar.append(f"{sembol} {sebep} - {engel_saat:.0f} saat bu coine girilmeyecek.")
+        if KAYIP_SERISI_LIMIT > 0 and self.ardisik_kayip >= KAYIP_SERISI_LIMIT:
+            self.mola_bitis = simdi + timedelta(hours=KAYIP_SERISI_MOLA_SAAT)
+            mesajlar.append(f"Art arda {self.ardisik_kayip} zararli islem - yeni alimlara "
+                            f"{KAYIP_SERISI_MOLA_SAAT:.0f} saat mola.")
+            self.ardisik_kayip = 0
+        return mesajlar
+
+    def sermaye_hareketi(self, fark: float) -> None:
+        """Para yatirma (+) / cekme (-): kar-zarar sayilmasin, fren tetiklenmesin."""
+        self.yatirilan_sermaye = max(0.0, self.yatirilan_sermaye + fark)
+        self.zirve_portfoy = max(0.0, self.zirve_portfoy + fark)
+        if self.gun_baslangic_portfoy > 0:
+            self.gun_baslangic_portfoy = max(0.0, self.gun_baslangic_portfoy + fark)
+
+    def temizle(self, simdi: Optional[datetime] = None) -> None:
+        simdi = simdi or datetime.now()
+        self.coin_engel = {s: t for s, t in self.coin_engel.items() if t > simdi}
+        sinir = simdi - timedelta(days=COIN_TEKRAR_KAYIP_GUN)
+        kayiplar = {s: [t for t in liste if t > sinir] for s, liste in self.coin_kayiplari.items()}
+        self.coin_kayiplari = {s: liste for s, liste in kayiplar.items() if liste}
+
+    def durum_satirlari(self, portfoy: float, simdi: Optional[datetime] = None) -> list:
+        simdi = simdi or datetime.now()
+        satirlar = [f"Risk: islem basina %{RISK_PCT * 100:g} | bugun %{self.gunluk_degisim(portfoy) * 100:+.1f} "
+                    f"(limit -%{GUNLUK_ZARAR_LIMIT_PCT * 100:g}) | zirveden -%{self.zirveden_dusus(portfoy) * 100:.1f} "
+                    f"(acil fren %{MAX_DRAWDOWN_PCT * 100:.0f})"]
+        engel = self.yeni_alim_engeli(portfoy, simdi)
+        if engel:
+            satirlar.append(f"Yeni alim engeli: {engel[1]}")
+        engelli = sorted((s, t) for s, t in self.coin_engel.items() if t > simdi)
+        if engelli:
+            satirlar.append("Engelli coinler: " + ", ".join(f"{s} ({t.strftime('%d.%m %H:%M')})" for s, t in engelli))
+        return satirlar
+
+    def to_dict(self) -> dict:
+        return {
+            "yatirilan_sermaye": self.yatirilan_sermaye,
+            "zirve_portfoy": self.zirve_portfoy,
+            "gun": self.gun,
+            "gun_baslangic_portfoy": self.gun_baslangic_portfoy,
+            "ardisik_kayip": self.ardisik_kayip,
+            "mola_bitis": self.mola_bitis.isoformat() if self.mola_bitis else None,
+            "coin_engel": {s: t.isoformat() for s, t in self.coin_engel.items()},
+            "coin_kayiplari": {s: [t.isoformat() for t in liste] for s, liste in self.coin_kayiplari.items()},
+            "acil_fren_tetiklendi": self.acil_fren_tetiklendi,
+            "fren_beklemede": self.fren_beklemede,
+        }
+
+    @classmethod
+    def from_dict(cls, veri: Optional[dict]) -> "RiskKorumasi":
+        obj = cls()
+        if not isinstance(veri, dict):
+            return obj
+        try:
+            obj.yatirilan_sermaye = float(veri.get("yatirilan_sermaye") or 0.0)
+            obj.zirve_portfoy = float(veri.get("zirve_portfoy") or 0.0)
+            obj.gun = str(veri.get("gun") or "")
+            obj.gun_baslangic_portfoy = float(veri.get("gun_baslangic_portfoy") or 0.0)
+            obj.ardisik_kayip = int(veri.get("ardisik_kayip") or 0)
+        except (TypeError, ValueError):
+            pass
+        obj.mola_bitis = _tarih_oku(veri.get("mola_bitis"))
+        obj.coin_engel = {s: t for s, t in ((s, _tarih_oku(v)) for s, v in (veri.get("coin_engel") or {}).items()) if t}
+        obj.coin_kayiplari = {s: [t for t in map(_tarih_oku, liste or []) if t]
+                              for s, liste in (veri.get("coin_kayiplari") or {}).items()}
+        obj.acil_fren_tetiklendi = bool(veri.get("acil_fren_tetiklendi"))
+        obj.fren_beklemede = bool(veri.get("fren_beklemede"))
+        return obj
+
+
+_risk = RiskKorumasi()
+
+
+def risk_bazli_tutar(portfoy: float, stop_pct: float, ust_sinir: float) -> float:
+    """Stop olursa kayip portfoyun RISK_PCT'si olacak pozisyon tutari (ust_sinir'i asmaz)."""
+    if RISK_PCT <= 0 or stop_pct <= 0 or portfoy <= 0:
+        return ust_sinir
+    return min(ust_sinir, max(portfoy * RISK_PCT / stop_pct, MIN_POZISYON_TUTARI_TRY))
+
+
+# ==========================================================================
+# v20 BOLUM 2: ISLEM GUNLUGU (kapanan her islem icin bir satir)
+# ==========================================================================
+ISLEM_GUNLUGU_ALANLARI = [
+    "giris_zamani", "cikis_zamani", "sembol", "kaynak", "giris_fiyati", "cikis_fiyati", "tutar_try",
+    "net_kar_try", "net_kar_pct", "r_sonucu", "risk_try", "stop_pct", "sure_saat", "cikis_sebebi",
+    "hedef1", "hedef2", "puan", "btc_rejimi", "gunluk_trend", "h4_trend", "rsi_1h", "adx_4h", "goreceli_hacim",
+]
+GIRIS_ANALIZ_ALANLARI = {"puan": "skor", "btc_rejimi": "btc_rejim", "gunluk_trend": "gunluk_trend",
+                         "h4_trend": "h4_trend", "rsi_1h": "rsi_1h", "adx_4h": "adx_4h",
+                         "goreceli_hacim": "goreceli_hacim"}
+
+
+def _sayi(deger) -> Optional[float]:
+    if deger is None or deger == "":
+        return None
+    try:
+        return float(deger)
+    except (TypeError, ValueError):
+        return None
+
+
+def giris_analiz_ozeti(derin: Optional[dict]) -> dict:
+    """Detayli analizden gunluge yazilacak alanlar (analiz yoksa bos)."""
+    derin = derin or {}
+    if not derin.get("gecti"):
+        return {}
+    return {alan: derin.get(kaynak) for alan, kaynak in GIRIS_ANALIZ_ALANLARI.items()}
+
+
+def islem_kaydi_olustur(sembol: str, kaynak: str, giris_zamani: Optional[datetime], cikis_zamani: datetime,
+                        giris_fiyati: float, cikis_fiyati: float, tutar: float, net_kar: float,
+                        risk_try: float, stop_pct: float, cikis_sebebi: str, hedef1: bool, hedef2: bool,
+                        analiz: Optional[dict] = None) -> dict:
+    kayit = {
+        "giris_zamani": giris_zamani.strftime("%Y-%m-%d %H:%M") if giris_zamani else "",
+        "cikis_zamani": cikis_zamani.strftime("%Y-%m-%d %H:%M"),
+        "sembol": sembol, "kaynak": kaynak, "giris_fiyati": giris_fiyati, "cikis_fiyati": cikis_fiyati,
+        "tutar_try": tutar, "net_kar_try": net_kar,
+        "net_kar_pct": net_kar / tutar * 100 if tutar else None,
+        "r_sonucu": net_kar / risk_try if risk_try > 0 else None,
+        "risk_try": risk_try, "stop_pct": stop_pct * 100 if stop_pct else None,
+        "sure_saat": (cikis_zamani - giris_zamani).total_seconds() / 3600 if giris_zamani else None,
+        "cikis_sebebi": cikis_sebebi, "hedef1": "E" if hedef1 else "H", "hedef2": "E" if hedef2 else "H",
+    }
+    for alan in GIRIS_ANALIZ_ALANLARI:
+        kayit[alan] = (analiz or {}).get(alan)
+    return kayit
+
+
+def _gunluk_degeri(deger) -> str:
+    if deger is None:
+        return ""
+    if isinstance(deger, float):
+        return f"{deger:.8g}" if abs(deger) < 1 else f"{deger:.4f}".rstrip("0").rstrip(".")
+    return str(deger)
+
+
+def islem_gunlugune_yaz(kayit: dict, dosya: str = ISLEM_GUNLUGU_CSV) -> None:
+    dosya_var = os.path.exists(dosya)
+    try:
+        with open(dosya, "a", newline="", encoding="utf-8") as f:
+            yazici = csv.writer(f)
+            if not dosya_var:
+                yazici.writerow(ISLEM_GUNLUGU_ALANLARI)
+            yazici.writerow([_gunluk_degeri(kayit.get(alan)) for alan in ISLEM_GUNLUGU_ALANLARI])
+    except Exception as e:
+        print(f"{RED}  (Islem gunlugu yazilamadi: {e}){RESET}")
+
+
+def islem_gunlugunu_oku(dosya: str = ISLEM_GUNLUGU_CSV, gun: Optional[int] = None) -> list:
+    if not os.path.exists(dosya):
+        return []
+    try:
+        with open(dosya, newline="", encoding="utf-8") as f:
+            kayitlar = list(csv.DictReader(f))
+    except Exception as e:
+        print(f"{RED}  (Islem gunlugu okunamadi: {e}){RESET}")
+        return []
+    if gun:
+        sinir = (datetime.now() - timedelta(days=gun)).strftime("%Y-%m-%d %H:%M")
+        kayitlar = [k for k in kayitlar if (k.get("cikis_zamani") or "") >= sinir]
+    return kayitlar
+
+
+def _ortalama(degerler: list) -> float:
+    return sum(degerler) / len(degerler) if degerler else 0.0
+
+
+def _grup_ozeti(baslik: str, kayitlar: list, anahtar, sira: Optional[list] = None) -> str:
+    gruplar: dict = {}
+    for k in kayitlar:
+        gruplar.setdefault(anahtar(k), []).append(k)
+    parcalar = []
+    for ad in (sira or sorted(gruplar)):
+        grup = gruplar.get(ad)
+        if not grup:
+            continue
+        kar = [_sayi(k.get("net_kar_try")) or 0.0 for k in grup]
+        rler = [r for r in (_sayi(k.get("r_sonucu")) for k in grup) if r is not None]
+        kazanan = sum(1 for x in kar if x > 0)
+        parcalar.append(f"{ad}: {len(grup)} islem, %{kazanan / len(grup) * 100:.0f} kazanan, "
+                        + (f"{_ortalama(rler):+.2f}R" if rler else f"{sum(kar):+.2f} TL"))
+    return f"{baslik}: " + " | ".join(parcalar)
+
+
+def _puan_grubu(kayit: dict) -> str:
+    puan = _sayi(kayit.get("puan"))
+    if puan is None:
+        return "puansiz"
+    return "<60" if puan < 60 else "60-70" if puan < 70 else "70+"
+
+
+def islem_ozeti_satirlari(kayitlar: list) -> list:
+    """Islem gunlugu / gecmis veri testi icin ortak ozet."""
+    if not kayitlar:
+        return ["Henuz kapanmis islem yok."]
+    kar = [_sayi(k.get("net_kar_try")) or 0.0 for k in kayitlar]
+    kazanc, kayip = [x for x in kar if x > 0], [x for x in kar if x <= 0]
+    rler = [r for r in (_sayi(k.get("r_sonucu")) for k in kayitlar) if r is not None]
+    cikislar: dict = {}
+    for k, x in zip(kayitlar, kar):
+        sebep = k.get("cikis_sebebi") or "?"
+        adet, toplam = cikislar.get(sebep, (0, 0.0))
+        cikislar[sebep] = (adet + 1, toplam + x)
+    return [
+        f"Islem: {len(kar)} | kazanan {len(kazanc)} (%{len(kazanc) / len(kar) * 100:.0f}) | net {sum(kar):+,.2f} TL",
+        f"Ortalama: kazanc {_ortalama(kazanc):+.2f} TL / kayip {_ortalama(kayip):+.2f} TL"
+        + (f" | islem basina {_ortalama(rler):+.2f}R" if rler else ""),
+        "Cikislar: " + ", ".join(f"{s} {a} ({t:+.2f} TL)"
+                                 for s, (a, t) in sorted(cikislar.items(), key=lambda kv: kv[1][1])),
+        _grup_ozeti("Puana gore", kayitlar, _puan_grubu, ["<60", "60-70", "70+", "puansiz"]),
+        _grup_ozeti("BTC rejimine gore", kayitlar, lambda k: k.get("btc_rejimi") or "bilinmiyor",
+                    ["GUCLU", "NOTR", "ZAYIF", "BILINMIYOR", "bilinmiyor"]),
+    ]
+
+
+# ==========================================================================
 # v10 BOLUM 5: GENEL HTTP ISTEK KATMANI - EXPONENTIAL BACKOFF
 # ==========================================================================
 
@@ -1163,6 +1510,7 @@ def durumu_kaydet(kasa: "MerkeziKasa", pozisyonlar: dict, rapor: "RaporlamaDurum
             "kasa_baslangic": kasa.baslangic,
             "kasa_toplam_komisyon": kasa.toplam_komisyon,
             "kaydedilme_zamani": datetime.now().isoformat(),
+            "risk": _risk.to_dict(),  # v20
             "pozisyonlar": {},
         }
         if rapor is not None:
@@ -1186,6 +1534,8 @@ def durumu_kaydet(kasa: "MerkeziKasa", pozisyonlar: dict, rapor: "RaporlamaDurum
                 "son_satis_zamani": b.son_satis_zamani.isoformat() if b.son_satis_zamani else None,
                 "alis_zamani": b.alis_zamani.isoformat() if b.alis_zamani else None,  # v16
                 "son_cooldown_dakika": b.son_cooldown_dakika,  # v16
+                "giris_bilgi": b.giris_bilgi,  # v20
+                "acik_islem_pnl": b.acik_islem_pnl,
                 "grid": [
                     {
                         "price": lvl.price,
@@ -1303,6 +1653,8 @@ def durumdan_kasa_ve_pozisyonlar_olustur(veri: dict):
         alis = p.get("alis_zamani")  # v16
         b.alis_zamani = datetime.fromisoformat(alis) if alis else None
         b.son_cooldown_dakika = p.get("son_cooldown_dakika", COOLDOWN_MINUTES)  # v16
+        b.giris_bilgi = p.get("giris_bilgi") or {}  # v20
+        b.acik_islem_pnl = p.get("acik_islem_pnl", 0.0)
         b.grid = [
             GridLevel(
                 price=lvl["price"],
@@ -1461,7 +1813,7 @@ def _ag_hatasi_ipucu(hata: Exception) -> None:
         f"Python'un kullandigi proxy: {proxyler or 'yok'}",
         "Ne yapmali: VPN'i kapatip/acip, antivirusun HTTPS taramasini gecici kapatip veya",
         "baska bir aga (orn. telefon hotspot) gecip tekrar deneyin. Ayrintili teshis icin:",
-        "    python project_aurelius_bot_v19.py baglanti",
+        "    python project_aurelius_bot_v20.py baglanti",
     ]
     if proxyler:
         satirlar.append("Proxy'yi bu pencerede devre disi birakmak icin:  set NO_PROXY=*")
@@ -1503,7 +1855,7 @@ def _ham_yanit_ozeti(ham: bytes) -> str:
 
 def baglanti_testi() -> None:
     """
-    'python project_aurelius_bot_v19.py baglanti' ile calisir. API anahtari
+    'python project_aurelius_bot_v20.py baglanti' ile calisir. API anahtari
     GEREKTIRMEZ, emir GONDERMEZ. Binance TR'ye giden yolu adim adim test
     eder (DNS -> TLS el sikisma -> ozel API sunucusu -> piyasa verisi
     sunucusu) ve sorunun nerede oldugunu gosterir.
@@ -1818,6 +2170,19 @@ def mutabakat_yap(kasa: "MerkeziKasa", pozisyonlar: dict) -> None:
               f"({eski_bakiye:,.2f} -> {gercek_bakiye:,.2f} TRY, fark: {fark:+,.2f}){RESET}")
         logger.warning("Mutabakat: kasa bakiyesi %.2f -> %.2f (fark %.2f)", eski_bakiye, gercek_bakiye, fark)
 
+    acik_once = sum(1 for b in pozisyonlar.values() if b.has_open_position)
+    _mutabakat_pozisyonlari(bakiyeler, pozisyonlar)
+    kapanan = acik_once - sum(1 for b in pozisyonlar.values() if b.has_open_position)
+    # v20: pozisyon kapanmadan TRY bakiyesi belirgin degistiyse bu bot disi para yatirma/cekmedir:
+    # kar/zarar sayilmaz, acil fren referansi ve sermaye tabani ayni miktarda kaydirilir.
+    if kapanan == 0 and _sermaye_hareketi_mi(fark, v9_toplam_portfoy_degeri(kasa, pozisyonlar)):
+        _risk.sermaye_hareketi(fark)
+        print(f"{CYAN}  MUTABAKAT: TRY bakiyesi bot disinda {fark:+,.2f} TRY degisti - para "
+              f"{'yatirma' if fark > 0 else 'cekme'} olarak kaydedildi (kar/zarar sayilmadi).{RESET}")
+        logger.warning("Mutabakat: sermaye hareketi %.2f TRY", fark)
+
+
+def _mutabakat_pozisyonlari(bakiyeler: dict, pozisyonlar: dict) -> None:
     for bot in pozisyonlar.values():
         if not bot.has_open_position:
             continue
@@ -2129,6 +2494,40 @@ class GridLevel:
     tp2_alindi: bool = False
 
 
+def r_stop_hesapla(level: GridLevel) -> tuple:
+    """v19: R tabanli stop (asla asagi inmez): ilk stop -> hedef 1 sonrasi
+    basa-bas -> takip eden stop (zirve - k x ATR) -> hedef 2 sonrasi +1R kilidi.
+    Donus: (stop_seviyesi, etiket). v20: gecmis veri testi de bunu kullanir."""
+    b, r = level.buy_price, level.risk_birimi
+    stop, etiket = (level.ilk_stop or b - r), "STOP-LOSS"
+    if level.tp1_alindi:
+        basa_bas = b * (1 + 3 * (KOMISYON_PCT + SLIPAJ_MAKS_PCT))
+        if basa_bas > stop:
+            stop, etiket = basa_bas, "BREAKEVEN-STOP"
+        katsayi = (CHANDELIER_SIKI_ATR_KATSAYI if level.en_yuksek_fiyat >= b + CHANDELIER_SIKI_R * r
+                   else CHANDELIER_ATR_KATSAYI)
+        takip = level.en_yuksek_fiyat - katsayi * (level.atr_giris or r / R_STOP_ATR_KATSAYI)
+        if takip > stop:
+            stop, etiket = takip, "TRAILING-STOP"
+    if level.tp2_alindi:
+        kilit = b + TP2_SONRASI_KILIT_R * r
+        if kilit > stop:
+            stop, etiket = kilit, "KAR-KILIDI-STOP"
+    return stop, etiket
+
+
+def giris_stop_pct(fiyat: float, derin: Optional[dict], giris_bilgisi: Optional[dict]) -> float:
+    """v19/v20: giriste stop mesafesi (oran): analizdeki destek/ATR stop'u, yoksa
+    1.5 x ATR tahmini, o da yoksa STOP_LOSS_PCT; %2-6 araligina sikistirilir."""
+    derin = derin or {}
+    if derin.get("stop_fiyati") and fiyat > 0:
+        stop_pct = (fiyat - derin["stop_fiyati"]) / fiyat
+    else:
+        atr_tahmini = (giris_bilgisi or {}).get("atr14")
+        stop_pct = R_STOP_ATR_KATSAYI * atr_tahmini / fiyat if (atr_tahmini and fiyat > 0) else STOP_LOSS_PCT
+    return min(max(stop_pct, R_STOP_MIN_PCT), R_STOP_MAKS_PCT)
+
+
 def _cooldown_suresi_hesapla(tag: str) -> float:
     """
     v16 BOLUM 2: Islem SONUCUNA (kapanis etiketine) gore dinamik cooldown
@@ -2262,6 +2661,8 @@ def en_kaliteli_aday_belirle(bilgi_map: dict, pozisyonlar: dict) -> Optional[str
         bot = pozisyonlar.get(sym)
         if bot is not None and (bot.has_open_position or bot.cooldown_aktif_mi() or bot.bekliyor):
             continue
+        if _risk.coin_engel_bitisi(sym) is not None:
+            continue  # v20: stop/tekrarlayan zarar sonrasi bu coine bir sure girilmez
         derin = bilgi.get("derin")
         if derin is not None:
             # v19: detayli analizden GECMEYEN coine asla girilmez; gecenler puana gore
@@ -2331,6 +2732,8 @@ class CoinBot:
     bildirim_aktif: bool = True   # v10: False ise Telegram bildirimi gonderilmez (backtest icin)
     alis_zamani: Optional[datetime] = None      # v16: zaman bazli bayat pozisyon cikisi icin
     son_cooldown_dakika: float = COOLDOWN_MINUTES  # v16: son kapanisin SONUCUNA gore belirlenen dinamik sure
+    giris_bilgi: dict = field(default_factory=dict)  # v20: giris zamani/miktari/analiz - islem gunlugu icin
+    acik_islem_pnl: float = 0.0                       # v20: acik islemin kismi satislardan gelen net K/Z'si
 
     def __post_init__(self):
         self.cash_try = self.starting_try
@@ -2470,25 +2873,7 @@ class CoinBot:
             return None
 
     def _r_stop_hesapla(self, level: "GridLevel") -> tuple:
-        """v19: R tabanli stop (asla asagi inmez): ilk stop -> hedef 1 sonrasi
-        basa-bas -> takip eden stop (zirve - k x ATR) -> hedef 2 sonrasi +1R kilidi.
-        Donus: (stop_seviyesi, etiket)."""
-        b, r = level.buy_price, level.risk_birimi
-        stop, etiket = (level.ilk_stop or b - r), "STOP-LOSS"
-        if level.tp1_alindi:
-            basa_bas = b * (1 + 3 * (KOMISYON_PCT + SLIPAJ_MAKS_PCT))
-            if basa_bas > stop:
-                stop, etiket = basa_bas, "BREAKEVEN-STOP"
-            katsayi = (CHANDELIER_SIKI_ATR_KATSAYI if level.en_yuksek_fiyat >= b + CHANDELIER_SIKI_R * r
-                       else CHANDELIER_ATR_KATSAYI)
-            takip = level.en_yuksek_fiyat - katsayi * (level.atr_giris or r / R_STOP_ATR_KATSAYI)
-            if takip > stop:
-                stop, etiket = takip, "TRAILING-STOP"
-        if level.tp2_alindi:
-            kilit = b + TP2_SONRASI_KILIT_R * r
-            if kilit > stop:
-                stop, etiket = kilit, "KAR-KILIDI-STOP"
-        return stop, etiket
+        return r_stop_hesapla(level)
 
     def _ratchet_stop_hesapla(self, level: "GridLevel") -> tuple:
         """v14: UC KADEMELI RATCHET STOP hesabini SALT-OKUNUR olarak
@@ -2829,9 +3214,36 @@ class CoinBot:
                           telegram_bildir=self.bildirim_aktif,
                           net_pnl=islem_net_pnl, net_pnl_pct=islem_net_pnl_pct,
                           guncel_kasa=(kasa.bakiye if kasa is not None else None))
+        if kasa is not None:
+            self.acik_islem_pnl += islem_net_pnl  # v20
+            if tam_kapanis:
+                self._islem_kapanisini_isle(level, exec_price, tag)
         if durum_kaydet is not None:
             durum_kaydet()
         return True
+
+    def _islem_kapanisini_isle(self, level: "GridLevel", cikis_fiyati: float, tag: str) -> None:
+        """v20: tamamen kapanan islemi gunluge yazar ve risk korumasina bildirir
+        (coin engeli, art arda zarar molasi)."""
+        gb = self.giris_bilgi or {}
+        simdi = datetime.now()
+        toplam = self.acik_islem_pnl - (gb.get("komisyon") or 0.0)  # alim komisyonu da islemin maliyeti
+        tutar = gb.get("tutar") or level.buy_price * (gb.get("miktar") or 0.0)
+        risk_try = (gb.get("miktar") or 0.0) * level.risk_birimi
+        kayit = islem_kaydi_olustur(
+            self.symbol, _aktif_calisma_modu(), _tarih_oku(gb.get("zaman")), simdi, level.buy_price, cikis_fiyati,
+            tutar, toplam, risk_try, level.risk_birimi / level.buy_price if level.buy_price else 0.0, tag,
+            level.tp1_alindi, level.tp2_alindi, gb.get("analiz"))
+        islem_gunlugune_yaz(kayit)
+        if risk_try > 0:
+            print(f"[{ts()}] {MAGENTA}{self.symbol:<9}{RESET} islem kapandi: {toplam:+,.2f} TRY "
+                  f"({kayit['r_sonucu']:+.2f}R)")
+        for mesaj in _risk.islem_kapandi(self.symbol, toplam, tag, simdi):
+            print(f"[{ts()}] {YELLOW}RISK KORUMASI: {mesaj}{RESET}")
+            if self.bildirim_aktif:
+                send_telegram(f"\U0001F6E1 <b>Risk korumasi</b>\n{html.escape(mesaj)}")
+        self.acik_islem_pnl = 0.0
+        self.giris_bilgi = {}
 
     def stop_loss_kontrol(self, price: float, sim: bool, kasa: Optional[MerkeziKasa] = None,
                            acik_pozisyon_sayaci: Optional[list] = None,
@@ -3036,7 +3448,8 @@ class CoinBot:
                      rapor: Optional["RaporlamaDurumu"] = None,
                      giris_bilgisi: Optional[dict] = None,
                      en_kaliteli_aday: Optional[str] = None,
-                     sniper_modu: bool = False):
+                     sniper_modu: bool = False,
+                     portfoy_degeri: Optional[float] = None):
         """
         COIN BASINA TEK ACIK POZISYON kuralini uygular: tek pozisyon,
         cooldown, mutex. v14'te MAX_OPEN_POSITIONS SABITI KALDIRILDI -
@@ -3109,7 +3522,10 @@ class CoinBot:
                           f"likidite sig kabul edildi (bid={en_iyi_bid}, ask={en_iyi_ask}).{RESET}")
                     continue
 
-                yatirim_tutari = min(hedef_pozisyon_tutari, kasa.bakiye / (1 + KOMISYON_PCT))
+                # v20: pozisyon, stop olursa kayip portfoyun RISK_PCT'si olacak buyuklukte
+                portfoy = portfoy_degeri if portfoy_degeri is not None else kasa.bakiye
+                yatirim_tutari = risk_bazli_tutar(portfoy, giris_stop_pct(price, derin, giris_bilgisi),
+                                                  min(hedef_pozisyon_tutari, kasa.bakiye / (1 + KOMISYON_PCT)))
                 if yatirim_tutari <= 0:
                     continue
 
@@ -3134,18 +3550,17 @@ class CoinBot:
                 level.buy_price = exec_price
                 level.en_yuksek_fiyat = exec_price
                 # v19: R (risk birimi) - analizdeki destek/ATR stop'u, yoksa ATR tahmini
-                if derin.get("stop_fiyati"):
-                    stop_pct = (exec_price - derin["stop_fiyati"]) / exec_price
-                else:
-                    atr_tahmini = (giris_bilgisi or {}).get("atr14")
-                    stop_pct = R_STOP_ATR_KATSAYI * atr_tahmini / exec_price if atr_tahmini else STOP_LOSS_PCT
-                stop_pct = min(max(stop_pct, R_STOP_MIN_PCT), R_STOP_MAKS_PCT)
+                stop_pct = giris_stop_pct(exec_price, derin, giris_bilgisi)
                 level.risk_birimi = exec_price * stop_pct
                 level.ilk_stop = exec_price - level.risk_birimi
                 level.atr_giris = (derin.get("atr_1h") or (giris_bilgisi or {}).get("atr14")
                                    or level.risk_birimi / R_STOP_ATR_KATSAYI)
                 level.tp1_alindi = level.tp2_alindi = level.kismi_kar_alindi = False
                 self.alis_zamani = datetime.now()  # v16: zaman bazli bayat pozisyon cikisi icin
+                self.giris_bilgi = {"zaman": self.alis_zamani.isoformat(), "miktar": buy_qty,
+                                    "tutar": yatirim_tutari, "komisyon": komisyon,
+                                    "analiz": giris_analiz_ozeti(derin)}  # v20
+                self.acik_islem_pnl = 0.0
                 self.bu_turda_islem_yapildi = True
                 acik_pozisyon_sayaci[0] += 1
                 if rapor is not None:
@@ -3183,6 +3598,9 @@ class CoinBot:
                 gb.update({k: derin[k] for k in ("ema50", "rsi14", "adx14") if derin.get(k) is not None})
                 analiz_ozeti = (f"puan {derin['skor']:.0f}/100 | 4s {derin.get('h4_trend')} | BTC {derin.get('btc_rejim')}"
                                 if derin.get("gecti") else None)
+                if RISK_PCT > 0 and portfoy > 0:  # v20: stop olursa portfoyun yuzde kaci gider
+                    analiz_ozeti = ((analiz_ozeti + " | ") if analiz_ozeti else "") + \
+                        f"risk %{yatirim_tutari * stop_pct / portfoy * 100:.1f}"
                 kart = giris_karti_olustur(
                     self.symbol, self.coin_name, gb.get("ema50"), gb.get("rsi14"), gb.get("adx14"),
                     buy_qty, exec_price, yatirim_tutari, hedef_fiyat, stop_fiyat,
@@ -3617,38 +4035,51 @@ def btc_rejim_analizi(zorla: bool = False) -> dict:
         except Exception as e:
             sonuc["notlar"].append(f"{sembol} verisi alinamadi: {e}")
             continue
-        if not h1 or not h4 or len(h1["kapanis"]) < 60 or len(h4["kapanis"]) < 60:
+        hesap = btc_rejim_hesapla(sembol, h1, h4, d1)
+        if hesap is None:
             sonuc["notlar"].append(f"{sembol} icin yeterli mum yok")
             continue
-        k1 = h1["kapanis"]
-        fiyat = h1["son_fiyat"]
-        degisim_4s = (fiyat / k1[-4] - 1) * 100
-        degisim_24s = (fiyat / k1[-24] - 1) * 100
-        atr1 = atr_hesapla(h1["yuksek"], h1["dusuk"], k1, 14)
-        atr_pct = atr1 / fiyat * 100 if atr1 and fiyat else 0.0
-        gunluk = _trend_yonu(d1["kapanis"], alt_tolerans=0.03) if d1 else "BILINMIYOR"
-        h4_trend = _trend_yonu(h4["kapanis"])
-        adx4, pdi4, mdi4 = adx_di_hesapla(h4["yuksek"], h4["dusuk"], h4["kapanis"], 14)
-        rsi1 = rsi_hesapla(k1[-60:], 14)
-
-        if (degisim_4s <= BTC_RISK_4S_DUSUS_PCT or degisim_24s <= BTC_RISK_24S_DUSUS_PCT
-                or (atr_pct >= BTC_RISK_ATR_PCT and degisim_4s < 0)):
-            rejim = "RISKLI"
-        elif h4_trend == "ASAGI" or gunluk == "ASAGI":
-            rejim = "ZAYIF"
-        elif gunluk == "YUKARI" and h4_trend == "YUKARI" and adx4 is not None and adx4 >= 20 and pdi4 > mdi4:
-            rejim = "GUCLU"
-        else:
-            rejim = "NOTR"
-        sonuc.update({
-            "rejim": rejim, "sembol": sembol, "fiyat": fiyat, "degisim_4s": degisim_4s,
-            "degisim_24s": degisim_24s, "atr_pct_1h": atr_pct, "gunluk_trend": gunluk,
-            "h4_trend": h4_trend, "adx_4h": adx4, "pdi_4h": pdi4, "mdi_4h": mdi4, "rsi_1h": rsi1,
-            "kapanis_1h": k1,
-        })
+        sonuc.update(hesap)
         break
     _btc_rejim_onbellek.update(zaman=simdi, sonuc=sonuc)
     return sonuc
+
+
+def _mumlar_yeterli(h1: Optional[dict], h4: Optional[dict]) -> bool:
+    return bool(h1 and h4 and len(h1["kapanis"]) >= 60 and len(h4["kapanis"]) >= 60)
+
+
+def btc_rejim_hesapla(sembol: str, h1: Optional[dict], h4: Optional[dict], d1: Optional[dict]) -> Optional[dict]:
+    """v20: BTC rejimini verilen mumlardan hesaplar (canli bot ve gecmis veri testi
+    ayni kurali kullanir). Veri yetersizse None."""
+    if not _mumlar_yeterli(h1, h4):
+        return None
+    k1 = h1["kapanis"]
+    fiyat = h1["son_fiyat"]
+    degisim_4s = (fiyat / k1[-4] - 1) * 100
+    degisim_24s = (fiyat / k1[-24] - 1) * 100
+    atr1 = atr_hesapla(h1["yuksek"], h1["dusuk"], k1, 14)
+    atr_pct = atr1 / fiyat * 100 if atr1 and fiyat else 0.0
+    gunluk = _trend_yonu(d1["kapanis"], alt_tolerans=0.03) if d1 else "BILINMIYOR"
+    h4_trend = _trend_yonu(h4["kapanis"])
+    adx4, pdi4, mdi4 = adx_di_hesapla(h4["yuksek"], h4["dusuk"], h4["kapanis"], 14)
+    rsi1 = rsi_hesapla(k1[-60:], 14)
+
+    if (degisim_4s <= BTC_RISK_4S_DUSUS_PCT or degisim_24s <= BTC_RISK_24S_DUSUS_PCT
+            or (atr_pct >= BTC_RISK_ATR_PCT and degisim_4s < 0)):
+        rejim = "RISKLI"
+    elif h4_trend == "ASAGI" or gunluk == "ASAGI":
+        rejim = "ZAYIF"
+    elif gunluk == "YUKARI" and h4_trend == "YUKARI" and adx4 is not None and adx4 >= 20 and pdi4 > mdi4:
+        rejim = "GUCLU"
+    else:
+        rejim = "NOTR"
+    return {
+        "rejim": rejim, "sembol": sembol, "fiyat": fiyat, "degisim_4s": degisim_4s,
+        "degisim_24s": degisim_24s, "atr_pct_1h": atr_pct, "gunluk_trend": gunluk,
+        "h4_trend": h4_trend, "adx_4h": adx4, "pdi_4h": pdi4, "mdi_4h": mdi4, "rsi_1h": rsi1,
+        "kapanis_1h": k1,
+    }
 
 
 def btc_raporu_satirlari(btc: dict) -> list:
@@ -3713,16 +4144,25 @@ def coin_derin_analiz(symbol: str, btc: Optional[dict] = None) -> dict:
     """Coini gunluk/4s/1s/15dk mumlar, hacim, destek/direnc, USDT paritesi ve BTC
     ile birlikte inceler. Donus: gecti (bool), skor (0-100), sebep (elendiyse),
     stop/hedef fiyatlari ve tum gosterge degerleri. Veri eksikse GIRILMEZ."""
-    a = {"symbol": symbol, "gecti": False, "skor": 0.0, "sebep": "", "puanlar": {}}
     try:
         h1 = mumlari_getir(symbol, "1h")
         h4 = mumlari_getir(symbol, "4h")
         d1 = mumlari_getir(symbol, "1d")
         m15 = mumlari_getir(symbol, "15m", 100)
     except Exception as e:
-        a["sebep"] = f"mum verisi alinamadi ({e})"
-        return a
-    if not h1 or not h4 or len(h1["kapanis"]) < 60 or len(h4["kapanis"]) < 60:
+        return {"symbol": symbol, "gecti": False, "skor": 0.0, "sebep": f"mum verisi alinamadi ({e})", "puanlar": {}}
+    if not _mumlar_yeterli(h1, h4):  # USDT paritesi bosuna sorgulanmasin
+        return derin_analiz_hesapla(symbol, h1, h4, d1, m15, btc)
+    return derin_analiz_hesapla(symbol, h1, h4, d1, m15, btc, _usd_trendi(symbol))
+
+
+def derin_analiz_hesapla(symbol: str, h1: Optional[dict], h4: Optional[dict], d1: Optional[dict],
+                         m15: Optional[dict], btc: Optional[dict] = None,
+                         usd: tuple = ("BILINMIYOR", None)) -> dict:
+    """v20: coin_derin_analiz'in hesap kismi - verilen mumlarla calisir, ag kullanmaz
+    (canli bot ve gecmis veri testi ayni kurallari kullanir). usd: (yon, usdt_sembolu)."""
+    a = {"symbol": symbol, "gecti": False, "skor": 0.0, "sebep": "", "puanlar": {}}
+    if not _mumlar_yeterli(h1, h4):
         a["sebep"] = "yeterli mum verisi yok (yeni listelenmis olabilir)"
         return a
     btc = btc or {"rejim": "BILINMIYOR"}
@@ -3745,7 +4185,7 @@ def coin_derin_analiz(symbol: str, btc: Optional[dict] = None) -> dict:
     ema20_15 = ema_hesapla(m15["kapanis"], 20) if m15 and len(m15["kapanis"]) >= 30 else None
     atr15 = (atr_hesapla(m15["yuksek"], m15["dusuk"], m15["kapanis"], 14)
              if m15 and len(m15["kapanis"]) >= 30 else None)
-    usd_trend, usd_sembol = _usd_trendi(symbol)
+    usd_trend, usd_sembol = usd
     korelasyon = getiri_korelasyonu(k1, btc.get("kapanis_1h") or [], 72)
 
     # Stop: once destegin hemen alti (%2-6 araliginda ise), yoksa 1.5 x ATR
@@ -4004,7 +4444,7 @@ def coin_degerlendir_ve_sec(semboller: list, sayisi: int):
 
 def print_banner():
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - v19'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - v20'.center(74)}{RESET}")
     print(f"{BOLD}{CYAN}  BINANCE TR AKILLI SECIM GRID BOT  |  PIYASA ADAPTIF MOTOR{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
     if CANLI_MOD:
@@ -4044,7 +4484,18 @@ def print_banner():
     print(f"{GRAY}  Dinamik cooldown   : kar={COOLDOWN_KAR_DAKIKA:.0f}dk, zarar={COOLDOWN_ZARAR_DAKIKA:.0f}dk, zaman asimi={COOLDOWN_ZAMAN_ASIMI_DAKIKA:.0f}dk{RESET}")
     if CANLI_MOD:
         print(f"{GRAY}  Bakiye mutabakati  : her ~{MUTABAKAT_ARALIGI_SAAT:.0f} saatte + gunluk X raporunda{RESET}")
-    print(f"{GRAY}  Acil fren limiti   : %{MAX_DRAWDOWN_PCT * 100:.0f}{RESET}")
+    print(f"{GRAY}  Acil fren limiti   : %{MAX_DRAWDOWN_PCT * 100:.0f} (portfoyun en yuksek degerinden; "
+          f"yeniden baslatmada sifirlanmaz){RESET}")
+    print(f"{GRAY}  Islem basina risk  : "
+          f"{f'%{RISK_PCT * 100:g} (stop olursa portfoyun en fazla bu kadari gider)' if RISK_PCT > 0 else 'kapali (tum kasa)'}"
+          f"{RESET}")
+    print(f"{GRAY}  Gunluk zarar limiti: "
+          f"{f'%{GUNLUK_ZARAR_LIMIT_PCT * 100:g} (asilirsa o gun yeni alim yok)' if GUNLUK_ZARAR_LIMIT_PCT > 0 else 'kapali'}"
+          f"{RESET}")
+    print(f"{GRAY}  Kayip korumasi     : "
+          + (f"art arda {KAYIP_SERISI_LIMIT} zarar -> {KAYIP_SERISI_MOLA_SAAT:.0f}s mola; " if KAYIP_SERISI_LIMIT else "")
+          + f"stop olan coin {COIN_STOP_ENGEL_SAAT:.0f}s, {COIN_TEKRAR_KAYIP_GUN} gunde {COIN_TEKRAR_KAYIP_SAYISI} "
+            f"zarar ettiren coin {COIN_TEKRAR_ENGEL_SAAT:.0f}s engelli{RESET}")
     print(f"{GRAY}  Durum dosyasi      : {STATE_DOSYASI}{RESET}")
     print(f"{GRAY}  Telegram bildirimi : {'AKTIF (arka plan kuyrugu)' if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else 'kapali (TELEGRAM_BOT_TOKEN/CHAT_ID tanimli degil)'}{RESET}")
     telegram_hazir = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
@@ -4057,6 +4508,7 @@ def print_banner():
     print(f"{GRAY}  Gunluk X raporu    : her 24 saatte bir (sayac restart'ta sifirlanmaz){RESET}")
     print(f"{GRAY}  Aylik Z raporu     : her 30 gunde bir -> {os.path.basename(Z_RAPORLARI_CSV)}{RESET}")
     print(f"{GRAY}  Islem kaydi        : {ISLEMLER_CSV}{RESET}")
+    print(f"{GRAY}  Islem gunlugu      : {ISLEM_GUNLUGU_CSV} ('rapor' komutu / Telegram /rapor){RESET}")
     print(f"{GRAY}  Portfoy kaydi      : {PORTFOY_CSV}{RESET}")
     print(f"{CYAN}{'-' * 74}{RESET}\n")
 
@@ -4230,7 +4682,7 @@ def print_performans_raporu(kasa: MerkeziKasa, pozisyonlar: dict, acik_pozisyon_
     print(f"{CYAN}{BOLD}{'=' * 70}{RESET}")
     print(f"{CYAN}{BOLD}  PERFORMANS RAPORU - {ts()}{RESET}")
     print(f"{CYAN}{BOLD}{'=' * 70}{RESET}")
-    print(f"  {'Baslangic Bakiyesi':<28}: {kasa.baslangic:>14,.2f} TRY")
+    print(f"  {'Baslangic Sermayesi':<28}: {kasa.baslangic:>14,.2f} TRY")
     print(f"  {'Guncel Bakiye':<28}: {guncel_bakiye:>14,.2f} TRY")
     print(f"  {'Net Kar/Zarar':<28}: {pnl_renk}{pnl:>+14,.2f} TRY  ({pnl_pct:+.2f}%){RESET}")
     print(f"  {'Toplam Odenen Komisyon':<28}: {kasa.toplam_komisyon:>14,.2f} TRY")
@@ -4442,17 +4894,23 @@ TELEGRAM_YARDIM_METNI = (
     "/hepsinisat - tum pozisyonlari piyasa fiyatindan sat (onay ister)\n"
     "/analiz SEMBOL - coinin detayli analizi (orn. /analiz PEPETRY)\n"
     "/btc - BTC piyasa rejimi\n"
+    "/rapor - son 30 gunun islem ozeti (islem gunlugunden)\n"
+    "/frensifirla - acil fren referansini bugunku portfoy degerine cek\n"
     "/yardim - bu liste"
 )
 
 
 def durum_ozeti_metni(kasa: "MerkeziKasa", pozisyonlar: dict) -> str:
     """/durum komutu ve periyodik durum bildirimi icin kisa HTML ozet."""
+    portfoy = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
+    pnl = portfoy - kasa.baslangic
     satirlar = [
         f"<b>Project Aurelius</b> ({_aktif_calisma_modu()}) - {datetime.now().strftime('%d.%m %H:%M')}",
-        f"Portfoy: {v9_toplam_portfoy_degeri(kasa, pozisyonlar):,.2f} TRY | Nakit: {kasa.bakiye:,.2f} TRY",
+        f"Portfoy: {portfoy:,.2f} TRY | Nakit: {kasa.bakiye:,.2f} TRY",
+        f"Baslangic: {kasa.baslangic:,.2f} TRY | toplam K/Z: {pnl:+,.2f} TRY"
+        + (f" (%{pnl / kasa.baslangic * 100:+.1f})" if kasa.baslangic else ""),
         f"Yeni alimlar: {ALIM_DURUMU_ACIKLAMA.get(_alim_durumu, _alim_durumu)}",
-    ]
+    ] + [html.escape(satir) for satir in _risk.durum_satirlari(portfoy)]
     acik = [b for b in pozisyonlar.values() if b.has_open_position]
     if not acik:
         satirlar.append("Acik pozisyon yok.")
@@ -4513,6 +4971,17 @@ def telegram_komutunu_uygula(komut: str, kasa: "MerkeziKasa", pozisyonlar: dict,
         return
     if komut == "/btc":
         send_telegram("<pre>" + html.escape("\n".join(btc_raporu_satirlari(btc_rejim_analizi()))) + "</pre>")
+        return
+    if komut == "/frensifirla":
+        portfoy = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
+        _risk.fren_sifirla(portfoy)
+        durum_kaydet()
+        send_telegram(f"\U0001F6E1 Acil fren referansi {portfoy:,.2f} TRY'ye cekildi; bu degerden "
+                      f"%{MAX_DRAWDOWN_PCT * 100:.0f} dususte fren tekrar devreye girer.")
+        return
+    if komut == "/rapor":
+        satirlar = ["Son 30 gun (islem gunlugu):"] + islem_ozeti_satirlari(islem_gunlugunu_oku(gun=30))
+        send_telegram("<pre>" + html.escape("\n".join(satirlar)) + "</pre>")
         return
     if komut == "/durum":
         send_telegram(durum_ozeti_metni(kasa, pozisyonlar))
@@ -4689,7 +5158,7 @@ def _bat_degeri(deger: str) -> str:
 
 
 def baslatici_olustur() -> int:
-    """'python project_aurelius_bot_v19.py kurulum': bu penceredeki ayarlarla, bot
+    """'python project_aurelius_bot_v20.py kurulum': bu penceredeki ayarlarla, bot
     cokerse/koparsa 60 sn sonra kendini yeniden baslatan baslatici dosyayi olusturur
     ve (Windows'ta, istege bagli) oturum acilinca otomatik baslatir."""
     gerekli = ["BINANCE_TR_API_KEY", "BINANCE_TR_SECRET_KEY", "AURELIUS_LIVE_CONFIRM", "AURELIUS_CANLI_MOD"]
@@ -4768,8 +5237,65 @@ def baslatici_olustur() -> int:
     return CIKIS_DUR
 
 
+def _sermaye_hareketi_mi(fark: float, portfoy: float) -> bool:
+    return abs(fark) >= max(SERMAYE_HAREKETI_MIN_TRY, portfoy * SERMAYE_HAREKETI_MIN_ORAN)
+
+
+def _risk_baslat(kasa: "MerkeziKasa", portfoy: float, risk_kayitli: bool) -> None:
+    """v20: sermaye tabani ve acil fren referansi - her acilista SIFIRLANMAZ."""
+    if not risk_kayitli or _risk.yatirilan_sermaye <= 0:
+        _risk.yatirilan_sermaye = portfoy if CANLI_MOD else (kasa.baslangic or portfoy)
+        _risk.zirve_portfoy = portfoy
+        print(f"{CYAN}  v20 sermaye takibi basladi: {portfoy:,.2f} TRY (bundan sonra yeniden baslatmada "
+              f"sifirlanmaz).{RESET}")
+    if BASLANGIC_SERMAYE_TRY > 0:
+        _risk.yatirilan_sermaye = BASLANGIC_SERMAYE_TRY
+    if _risk.acil_fren_tetiklendi or FREN_SIFIRLA:
+        _risk.fren_sifirla(portfoy)
+        print(f"{YELLOW}  {'Acil frenden sonra elle yeniden baslatildi' if not FREN_SIFIRLA else 'AURELIUS_FREN_SIFIRLA=1'}"
+              f": fren referansi {portfoy:,.2f} TRY'ye cekildi.{RESET}")
+    if _risk.zirve_portfoy <= 0:
+        _risk.zirve_portfoy = portfoy
+    if not _risk.fren_beklemede and _risk.zirveden_dusus(portfoy) >= MAX_DRAWDOWN_PCT:
+        # Dusus bot kapaliyken olmus (fiyat hareketi, elle islem, para cekme...): acilir acilmaz her seyi
+        # piyasa fiyatindan satmak yerine yeni alimlar durdurulur ve kullaniciya sorulur.
+        _risk.fren_beklemede = True
+        mesaj = (f"Portfoy ({portfoy:,.2f} TRY) kayitli en yuksek degerinden ({_risk.zirve_portfoy:,.2f} TRY) "
+                 f"%{_risk.zirveden_dusus(portfoy) * 100:.1f} asagida - dusus bot kapaliyken olmus. Acil fren "
+                 f"satis YAPMADI; yeni alimlar durduruldu, acik pozisyonlar stoplariyla yonetiliyor.")
+        print(f"{RED}{BOLD}  {mesaj}{RESET}")
+        print(f"{YELLOW}  Devam etmek icin Telegram'dan /frensifirla gonderin (veya AURELIUS_FREN_SIFIRLA=1 ile "
+              f"baslatin); hepsini satmak icin /hepsinisat.{RESET}")
+        send_telegram(f"\U0001F6A8 <b>Acil fren beklemede</b>\n{html.escape(mesaj)}\n"
+                      "Devam: /frensifirla | Hepsini sat: /hepsinisat")
+    _risk.portfoy_guncelle(portfoy)
+    _risk.temizle()
+    kasa.baslangic = _risk.yatirilan_sermaye
+    pnl = portfoy - kasa.baslangic
+    print(f"{CYAN}  Sermaye: baslangic {kasa.baslangic:,.2f} TRY | portfoy {portfoy:,.2f} TRY "
+          f"({pnl:+,.2f} TRY) | acil fren: {_risk.zirve_portfoy:,.2f} TRY zirvesinden "
+          f"%{MAX_DRAWDOWN_PCT * 100:.0f} dususte{RESET}")
+    for satir in _risk.durum_satirlari(portfoy)[1:]:
+        print(f"{YELLOW}  {satir}{RESET}")
+    print()
+
+
+def _risk_engeli_bildir(engel: Optional[tuple], onceki_kod: Optional[str]) -> Optional[str]:
+    """Yeni alim engeli basladiginda/bittiginde bir kez haber verir."""
+    kod = engel[0] if engel else None
+    if kod != onceki_kod:
+        if engel:
+            print(f"[{ts()}] {YELLOW}RISK KORUMASI: yeni alim yok - {engel[1]}{RESET}")
+            send_telegram(f"\U0001F6E1 <b>Yeni alimlar durdu</b>\n{html.escape(engel[1])}\n"
+                          "Acik pozisyonlar yonetilmeye devam ediyor.")
+        elif onceki_kod:
+            print(f"[{ts()}] {GREEN}RISK KORUMASI: yeni alimlar tekrar acik.{RESET}")
+            send_telegram("\U0001F6E1 Risk korumasi: yeni alimlar tekrar acik.")
+    return kod
+
+
 def run_simulation():
-    global _alim_durumu
+    global _alim_durumu, _risk
     print_banner()
 
     if CANLI_MOD and not canli_mod_on_kontrol():
@@ -4805,6 +5331,8 @@ def run_simulation():
     except CanliDurumKorumasi as e:
         print(f"{RED}{BOLD}  {e}{RESET}")
         return CIKIS_AYAR_HATASI
+    risk_kayitli = bool(kayitli_durum and isinstance(kayitli_durum.get("risk"), dict))  # v20
+    _risk = RiskKorumasi.from_dict(kayitli_durum.get("risk") if kayitli_durum else None)
     if kayitli_durum:
         kasa, pozisyonlar, acik_baslangic_sayisi = durumdan_kasa_ve_pozisyonlar_olustur(kayitli_durum)
         acik_pozisyon_sayaci = [acik_baslangic_sayisi]
@@ -4844,6 +5372,7 @@ def run_simulation():
         for bot in pozisyonlar.values():
             if any(lvl.has_position and lvl.borsa_stop_emir_id for lvl in bot.grid):
                 bot.borsa_stop_bakimi(kasa, acik_pozisyon_sayaci, rapor, None, zorla_sorgu=True, yeni_kur=False)
+        onceki_serbest = kasa.bakiye  # v20: bot kapanirken kayitli serbest TRY
         try:
             bakiyeler = binance_hesap_bakiyeleri()
         except Exception as e:
@@ -4852,28 +5381,33 @@ def run_simulation():
         bakiye_ozeti_yazdir(bakiyeler)
         gercek_bakiye = bakiyeler.get("TRY", {}).get("free", 0.0)
         print(f"{GREEN}  CANLI MOD AKTIF - borsadan cekilen serbest TRY bakiyesi: {gercek_bakiye:,.2f} TRY{RESET}\n")
-        if gercek_bakiye > 0:
-            kasa.baslangic = gercek_bakiye
-            kasa.bakiye = gercek_bakiye
-        else:
-            # Okuma basarili ve bakiye gercekten 0: kasa ASLA sanal
-            # TOPLAM_SANAL_BAKIYE_TRY ile kalmamali, yoksa bot var olmayan
-            # parayla gercek emir gondermeye calisir.
-            kasa.bakiye = 0.0
-            if not kayitli_durum:
-                kasa.baslangic = 0.0
+        # v20: kasa.baslangic (sermaye tabani) artik her acilista sifirlanmiyor - bkz. _risk_baslat
+        # Bakiye 0 ise kasa ASLA sanal TOPLAM_SANAL_BAKIYE_TRY ile kalmamali, yoksa bot var
+        # olmayan parayla gercek emir gondermeye calisir.
+        kasa.bakiye = max(0.0, gercek_bakiye)
+        if gercek_bakiye <= 0:
             print(f"{YELLOW}  UYARI: Borsadaki serbest TRY bakiyesi 0 - yeni alim yapilmayacak "
                   f"(acik pozisyonlar yonetilmeye devam eder).{RESET}")
+        kapanan = 0
         if not kayitli_durum:
             rapor = RaporlamaDurumu(kasa.bakiye)  # X/Z tabanlari sanal degil gercek bakiyeden baslasin
         elif any(b.has_open_position for b in pozisyonlar.values()):
+            acik_once = sum(1 for b in pozisyonlar.values() if b.has_open_position)
             mutabakat_yap(kasa, pozisyonlar)  # bot kapaliyken elle satilan/degisen pozisyonlari hemen yakala
+            kapanan = acik_once - sum(1 for b in pozisyonlar.values() if b.has_open_position)
+        fark = kasa.bakiye - onceki_serbest
+        if risk_kayitli and kapanan == 0 and _sermaye_hareketi_mi(fark, v9_toplam_portfoy_degeri(kasa, pozisyonlar)):
+            _risk.sermaye_hareketi(fark)
+            print(f"{CYAN}  Bot kapaliyken TRY bakiyesi {fark:+,.2f} TRY degismis: para "
+                  f"{'yatirma' if fark > 0 else 'cekme'} olarak kaydedildi (kar/zarar sayilmadi).{RESET}")
         send_telegram(f"\U0001F7E2 <b>Project Aurelius CANLI MODDA baslatildi!</b>\nBorsa bakiyesi: {kasa.bakiye:,.2f} TRY"
                       f"\nYeni alimlar: {ALIM_DURUMU_ACIKLAMA[_alim_durumu]}"
                       f"\nBorsa stop emri: {'ACIK' if BORSA_STOP_AKTIF else 'kapali'}"
+                      f"\nIslem basina risk: %{RISK_PCT * 100:g} | gunluk zarar limiti: %{GUNLUK_ZARAR_LIMIT_PCT * 100:g}"
                       + ("\nKomutlar icin /yardim" if TELEGRAM_KOMUTLARI_AKTIF else ""))
     else:
         send_telegram(f"\U0001F9EA Project Aurelius SIMULASYON modunda baslatildi. Bakiye: {kasa.bakiye:,.2f} TRY")
+    _risk_baslat(kasa, v9_toplam_portfoy_degeri(kasa, pozisyonlar), risk_kayitli)  # v20
 
     def kaydet():
         durumu_kaydet(kasa, pozisyonlar, rapor)
@@ -4896,6 +5430,7 @@ def run_simulation():
     _saglik_pingi_gonder()
 
     real_poll_count = 0
+    son_risk_engeli = None  # v20
     son_btc_rejimi = None  # v19
     btc_rejimi = "BILINMIYOR"
     izin_verilen_pozisyon = 0  # v14: guvenli varsayilan (ilk tick'ten once bir kesinti olursa)
@@ -4945,6 +5480,11 @@ def run_simulation():
             )  # v17: kasaya gore adaptif Sniper Modu / kademeli portfoy modeli; v19: BTC rejimi
             if _alim_durumu != "ACIK":
                 izin_verilen_pozisyon = 0  # v18: /alimdurdur veya /bosalt - sadece yonetim, yeni alim yok
+            _risk.portfoy_guncelle(guncel_bakiye)  # v20: gunluk zarar limiti / kayip molasi
+            risk_engeli = _risk.yeni_alim_engeli(guncel_bakiye)
+            if risk_engeli:
+                izin_verilen_pozisyon = 0
+            son_risk_engeli = _risk_engeli_bildir(risk_engeli, son_risk_engeli)
             en_kaliteli_aday = en_kaliteli_aday_belirle(bilgi_map, pozisyonlar)  # v17 MODUL 1.2
 
             ilgilenilecek_semboller = sorted(set(pozisyonlar.keys()) | set(watchlist))
@@ -5006,7 +5546,8 @@ def run_simulation():
                                      hedef_pozisyon_tutari=hedef_pozisyon_tutari,
                                      izin_verilen_pozisyon=izin_verilen_pozisyon,
                                      durum_kaydet=kaydet, rapor=rapor, giris_bilgisi=bilgi_map.get(sym),
-                                     en_kaliteli_aday=en_kaliteli_aday, sniper_modu=sniper_modu_aktif)
+                                     en_kaliteli_aday=en_kaliteli_aday, sniper_modu=sniper_modu_aktif,
+                                     portfoy_degeri=guncel_bakiye)
                 bot.borsa_stop_bakimi(kasa, acik_pozisyon_sayaci, rapor, kaydet)  # v18
 
                 time.sleep(API_CALL_SLEEP_SECONDS)
@@ -5015,27 +5556,34 @@ def run_simulation():
             rapor.drawdown_guncelle(v9_toplam_portfoy_degeri(kasa, pozisyonlar))  # v11: Z donemi max drawdown takibi
             kaydet()  # her tick sonunda genel bir guvenlik-agi kaydi (bakiye/durum tazeligi)
 
-            if kasa.baslangic > 0:
-                guncel_kontrol = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
-                kayip_pct = (kasa.baslangic - guncel_kontrol) / kasa.baslangic
-                if kayip_pct >= MAX_DRAWDOWN_PCT:
-                    print(f"\n{RED}{BOLD}{'!' * 74}{RESET}")
-                    print(f"{RED}{BOLD}  ACIL FREN: Portfoy baslangictan %{kayip_pct*100:.2f} kaybetti "
-                          f"(limit: %{MAX_DRAWDOWN_PCT*100:.0f}). TUM ACIK POZISYONLAR TASFIYE EDILIYOR.{RESET}")
-                    print(f"{RED}{BOLD}{'!' * 74}{RESET}\n")
-                    send_telegram(f"\U0001F6A8\U0001F6A8 <b>ACIL FREN DEVREYE GIRDI</b> \U0001F6A8\U0001F6A8\n"
-                                  f"Portfoy %{kayip_pct*100:.2f} kayipta (limit %{MAX_DRAWDOWN_PCT*100:.0f}). "
-                                  f"Tum pozisyonlar tasfiye ediliyor.")
-                    for bot in pozisyonlar.values():
-                        if bot.has_open_position:
-                            bot.acil_tasfiye(bot.guncel_fiyat(), kasa, durum_kaydet=kaydet, rapor=rapor)
-                    acik_pozisyon_sayaci[0] = sum(1 for b in pozisyonlar.values() if b.has_open_position)
-                    print_trade_history_table(pozisyonlar.values())
-                    print_performans_raporu(kasa, pozisyonlar, 0, izin_verilen_pozisyon=0)
-                    print(f"{RED}Bot acil fren nedeniyle durduruldu. Ayarlardan MAX_DRAWDOWN_PCT degistirilebilir.{RESET}")
-                    return CIKIS_DUR
+            # v20: acil fren, portfoyun ulastigi en yuksek degerden olan dususu olcer
+            # (referans durum dosyasinda - yeniden baslatmada sifirlanmaz).
+            guncel_kontrol = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
+            _risk.portfoy_guncelle(guncel_kontrol)
+            kayip_pct = _risk.zirveden_dusus(guncel_kontrol)
+            if kayip_pct >= MAX_DRAWDOWN_PCT and not _risk.fren_beklemede:
+                print(f"\n{RED}{BOLD}{'!' * 74}{RESET}")
+                print(f"{RED}{BOLD}  ACIL FREN: Portfoy en yuksek degerinden ({_risk.zirve_portfoy:,.2f} TRY) "
+                      f"%{kayip_pct*100:.2f} dustu (limit: %{MAX_DRAWDOWN_PCT*100:.0f}). "
+                      f"TUM ACIK POZISYONLAR TASFIYE EDILIYOR.{RESET}")
+                print(f"{RED}{BOLD}{'!' * 74}{RESET}\n")
+                send_telegram(f"\U0001F6A8\U0001F6A8 <b>ACIL FREN DEVREYE GIRDI</b> \U0001F6A8\U0001F6A8\n"
+                              f"Portfoy en yuksek degerinden ({_risk.zirve_portfoy:,.2f} TRY) %{kayip_pct*100:.2f} "
+                              f"dustu (limit %{MAX_DRAWDOWN_PCT*100:.0f}). Tum pozisyonlar tasfiye ediliyor ve bot "
+                              f"duruyor.")
+                _risk.acil_fren_tetiklendi = True
+                for bot in pozisyonlar.values():
+                    if bot.has_open_position:
+                        bot.acil_tasfiye(bot.guncel_fiyat(), kasa, durum_kaydet=kaydet, rapor=rapor)
+                acik_pozisyon_sayaci[0] = sum(1 for b in pozisyonlar.values() if b.has_open_position)
+                print_trade_history_table(pozisyonlar.values())
+                print_performans_raporu(kasa, pozisyonlar, 0, izin_verilen_pozisyon=0)
+                print(f"{RED}Bot acil fren nedeniyle durduruldu. Elle yeniden baslatirsaniz fren referansi o anki "
+                      f"portfoy degerinden baslar.{RESET}")
+                return CIKIS_DUR
 
             if real_poll_count % scan_araligi_tur == 0:
+                _risk.temizle()  # v20: suresi dolan coin engelleri
                 try:
                     hedef_sayi = MIN_WATCHLIST if piyasa_sert_duste else MAX_WATCHLIST
                     watchlist, hacim_map, durum_map, bilgi_map = coin_degerlendir_ve_sec(semboller, hedef_sayi)
@@ -5104,7 +5652,7 @@ def run_simulation():
                     izin_verilen_sim, hedef_sim, sniper_sim = dinamik_pozisyon_planla(
                         kasa.bakiye, guncel_bakiye_sim, btc_degisim, btc_rejimi
                     )
-                    if _alim_durumu != "ACIK":
+                    if _alim_durumu != "ACIK" or _risk.yeni_alim_engeli(guncel_bakiye_sim):
                         izin_verilen_sim = 0
                     en_kaliteli_aday_sim = en_kaliteli_aday_belirle(bilgi_map, pozisyonlar)  # v17 MODUL 1.2
                     for bot in pozisyonlar.values():
@@ -5118,7 +5666,8 @@ def run_simulation():
                             bot.evaluate_v9(sim_price, sim=True, kasa=kasa, acik_pozisyon_sayaci=acik_pozisyon_sayaci,
                                              hedef_pozisyon_tutari=hedef_sim, izin_verilen_pozisyon=izin_verilen_sim,
                                              durum_kaydet=kaydet, rapor=rapor, giris_bilgisi=bilgi_map.get(bot.symbol),
-                                             en_kaliteli_aday=en_kaliteli_aday_sim, sniper_modu=sniper_sim)
+                                             en_kaliteli_aday=en_kaliteli_aday_sim, sniper_modu=sniper_sim,
+                                             portfoy_degeri=guncel_bakiye_sim)
 
     except KeyboardInterrupt:
         print(f"\n{YELLOW}--- Bot durduruldu (Ctrl+C) ---{RESET}\n")
@@ -5155,92 +5704,390 @@ def run_simulation():
 
 
 # ==========================================================================
-# BACKTEST MODU - v8/v9 ile AYNI (tek_pozisyon_modu=False, coklu-seviye grid)
+# v20 BOLUM 3: GECMIS VERI TESTI (BACKTEST) - canli botla AYNI analiz (derin_analiz_hesapla,
+# btc_rejim_hesapla), AYNI R cikislari (r_stop_hesapla) ve AYNI risk korumasi (RiskKorumasi).
+# Emir gondermez, API anahtari gerektirmez, Telegram'a yazmaz.
 # ==========================================================================
+ARALIK_MS = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}
+ISINMA_MUM = {"15m": 100, "1h": MUM_SAYISI, "4h": MUM_SAYISI, "1d": MUM_SAYISI}
+BACKTEST_VARSAYILAN_GUN = 60
+BACKTEST_GUN_ARALIGI = (7, 120)
+BACKTEST_VARSAYILAN_SERMAYE = 1000.0
+BACKTEST_COIN_SAYISI = 15
+BACKTEST_SLIPAJ_PCT = (SLIPAJ_MIN_PCT + SLIPAJ_MAKS_PCT) / 2
+_MUM_ALANLARI = ("acilis", "yuksek", "dusuk", "kapanis", "hacim", "alici_hacim")
 
-def gecmis_fiyatlari_getir(symbol: str, gun: int) -> list:
-    limit = min(gun * 24, 1000)
-    url = KLINES_URL_TEMPLATE.format(symbol=symbol, interval="1h", limit=limit)
-    req = urllib.request.Request(url, headers={"User-Agent": "grid-bot-sim"})
-    data = http_istek_yap(req, timeout=30)
-    return [float(mum[4]) for mum in data]
+
+def gecmis_mumlari_getir(symbol: str, interval: str, baslangic_ms: int, bitis_ms: int) -> Optional[dict]:
+    """[baslangic_ms, bitis_ms) arasinda KAPANMIS mumlari sayfa sayfa ceker. 'zaman' = acilis (ms)."""
+    adim = ARALIK_MS[interval]
+    veri = {"zaman": [], **{k: [] for k in _MUM_ALANLARI}}
+    bas = baslangic_ms
+    while bas < bitis_ms:
+        url = (KLINES_URL_TEMPLATE.format(symbol=symbol, interval=interval, limit=1000)
+               + f"&startTime={bas}&endTime={bitis_ms - 1}")
+        parca = http_istek_yap(urllib.request.Request(url, headers={"User-Agent": "project-aurelius-bot"}),
+                               timeout=30)
+        if not isinstance(parca, list) or not parca:
+            break
+        for m in parca:
+            acilis = int(m[0])
+            if acilis + adim > bitis_ms or (veri["zaman"] and acilis <= veri["zaman"][-1]):
+                continue
+            veri["zaman"].append(acilis)
+            for i, k in enumerate(("acilis", "yuksek", "dusuk", "kapanis", "hacim"), start=1):
+                veri[k].append(float(m[i]))
+            veri["alici_hacim"].append(float(m[9]) if len(m) > 9 else 0.0)
+        if len(parca) < 1000:
+            break
+        bas = int(parca[-1][0]) + adim
+        time.sleep(0.1)
+    return veri if veri["zaman"] else None
 
 
-def backtest_calistir(symbol: str, gun: int, sermaye: float = None):
-    sermaye = sermaye if sermaye is not None else TOPLAM_SANAL_BAKIYE_TRY
+class _GecmisSeri:
+    """Bir zaman dilimindeki gecmis mumlar; t anina kadar KAPANMIS son n mumu verir."""
 
+    def __init__(self, veri: dict, interval: str):
+        self.v, self.adim = veri, ARALIK_MS[interval]
+
+    def pencere(self, t: int, n: int, son_fiyat: float) -> Optional[dict]:
+        i = bisect.bisect_right(self.v["zaman"], t - self.adim)
+        if i < 2:
+            return None
+        j = max(0, i - n)
+        d = {k: self.v[k][j:i] for k in _MUM_ALANLARI}
+        d["son_fiyat"] = son_fiyat
+        return d
+
+
+def backtest_simule_et(coin_verileri: dict, btc_verisi: Optional[dict], bas_ms: int, bitis_ms: int,
+                       sermaye: float) -> dict:
+    """coin_verileri: {sembol: {"15m","1h","4h","1d","usd4h": gecmis_mumlari_getir ciktisi (veya None),
+    "usd_sembol": str|None}}; btc_verisi: {"sembol", "1h", "4h", "1d"}. Islemler 15 dakikalik mumlarla
+    yonetilir, yeni giris kararlari her saat basi (canli bot gibi tek seferde en yuksek puanli coin)."""
+    risk = RiskKorumasi()
+    nakit = sermaye
+    acik: dict = {}
+    son_kapanis: dict = {}         # sembol -> (ms, etiket) - cooldown icin
+    islemler: list = []
+    son_fiyat: dict = {}
+    sayac = {"gunluk_limit_gunleri": set(), "mola": 0, "coin_engeli": 0, "acil_fren": False,
+             "acik_saat": 0, "toplam_saat": 0, "komisyon": 0.0}
+    seri = {s: {k: _GecmisSeri(v[k], k) for k in ("1h", "4h", "1d") if v.get(k)}
+            for s, v in coin_verileri.items()}
+    usd_seri = {s: _GecmisSeri(v["usd4h"], "4h") for s, v in coin_verileri.items() if v.get("usd4h")}
+    idx15 = {s: {z: i for i, z in enumerate(v["15m"]["zaman"])} for s, v in coin_verileri.items() if v.get("15m")}
+    m15_seri = {s: _GecmisSeri(v["15m"], "15m") for s, v in coin_verileri.items() if v.get("15m")}
+    btc_seri = {k: _GecmisSeri(btc_verisi[k], k) for k in ("1h", "4h", "1d")
+                if btc_verisi and btc_verisi.get(k)}
+    zirve, en_derin = sermaye, 0.0
+    son_engel = None
+
+    def portfoy() -> float:
+        return nakit + sum(p["level"].buy_qty * son_fiyat[s] for s, p in acik.items())
+
+    def sat(sembol: str, miktar: float, fiyat: float, etiket: str, t: int, kapat: bool) -> None:
+        nonlocal nakit
+        p = acik[sembol]
+        lv = p["level"]
+        miktar = lv.buy_qty if kapat else min(miktar, lv.buy_qty)
+        brut = miktar * fiyat * (1 - BACKTEST_SLIPAJ_PCT)
+        kom = brut * KOMISYON_PCT
+        nakit += brut - kom
+        sayac["komisyon"] += kom
+        p["pnl"] += brut - kom - miktar * lv.buy_price
+        lv.buy_qty -= miktar
+        if not kapat and lv.buy_qty > 1e-12:
+            return
+        del acik[sembol]
+        simdi = datetime.fromtimestamp(t / 1000)
+        kayit = islem_kaydi_olustur(sembol, "TEST", datetime.fromtimestamp(p["giris_ms"] / 1000), simdi,
+                                    lv.buy_price, fiyat, p["tutar"], p["pnl"], p["miktar0"] * lv.risk_birimi,
+                                    lv.risk_birimi / lv.buy_price, etiket, lv.tp1_alindi, lv.tp2_alindi,
+                                    p["analiz"])
+        islemler.append(kayit)
+        son_kapanis[sembol] = (t, etiket)
+        if etiket != "TEST-SONU":
+            onceki_engel = risk.coin_engel.get(sembol)
+            onceki_mola = risk.mola_bitis
+            risk.islem_kapandi(sembol, p["pnl"], etiket, simdi)
+            sayac["coin_engeli"] += risk.coin_engel.get(sembol) != onceki_engel
+            sayac["mola"] += risk.mola_bitis != onceki_mola
+
+    def cikislari_isle(sembol: str, i: int, t_kapanis: int) -> None:
+        v = coin_verileri[sembol]["15m"]
+        acl, yuk, dus, kap = v["acilis"][i], v["yuksek"][i], v["dusuk"][i], v["kapanis"][i]
+        lv = acik[sembol]["level"]
+        b, r = lv.buy_price, lv.risk_birimi
+        stop, etiket = r_stop_hesapla(lv)
+        if dus <= stop:  # ayni mumda hem stop hem hedef olabilir: temkinli olarak once stop
+            sat(sembol, 0, min(stop, acl), etiket, t_kapanis, True)
+            return
+        if not lv.tp1_alindi and yuk >= b + TP1_R * r:
+            sat(sembol, lv.buy_qty * TP1_ORAN, max(b + TP1_R * r, acl), "KAR-AL-1", t_kapanis, False)
+            lv.tp1_alindi = True
+        if lv.tp1_alindi and not lv.tp2_alindi and yuk >= b + TP2_R * r:
+            sat(sembol, lv.buy_qty * TP2_ORAN, max(b + TP2_R * r, acl), "KAR-AL-2", t_kapanis, False)
+            lv.tp2_alindi = True
+        lv.en_yuksek_fiyat = max(lv.en_yuksek_fiyat, yuk)
+        yas_saat = (t_kapanis - acik[sembol]["giris_ms"]) / 3_600_000
+        if (not lv.tp1_alindi and yas_saat >= MAKS_POZISYON_OMRU_SAAT
+                and kap < b * (1 + ZAMAN_ASIMI_KAR_ESIGI_PCT)):
+            sat(sembol, 0, kap, "ZAMAN-ASIMI", t_kapanis, True)
+
+    def btc_durumu(t: int) -> dict:
+        if not btc_seri.get("1h") or not btc_seri.get("4h"):
+            return {"rejim": "BILINMIYOR"}
+        h1 = btc_seri["1h"].pencere(t, MUM_SAYISI, 0.0)
+        if not h1:
+            return {"rejim": "BILINMIYOR"}
+        h1["son_fiyat"] = h1["kapanis"][-1]
+        h4 = btc_seri["4h"].pencere(t, MUM_SAYISI, h1["son_fiyat"])
+        d1 = btc_seri["1d"].pencere(t, MUM_SAYISI, h1["son_fiyat"]) if btc_seri.get("1d") else None
+        return btc_rejim_hesapla(btc_verisi.get("sembol", "BTC"), h1, h4, d1) or {"rejim": "BILINMIYOR"}
+
+    def analiz(sembol: str, t: int, btc: dict) -> dict:
+        fiyat = son_fiyat[sembol]
+        s = seri[sembol]
+        if "1h" not in s or "4h" not in s:
+            return {"gecti": False}
+        h1, h4 = s["1h"].pencere(t, MUM_SAYISI, fiyat), s["4h"].pencere(t, MUM_SAYISI, fiyat)
+        d1 = s["1d"].pencere(t, MUM_SAYISI, fiyat) if "1d" in s else None
+        m15 = m15_seri[sembol].pencere(t, 100, fiyat)
+        usd = ("BILINMIYOR", None)
+        if sembol in usd_seri:
+            u4 = usd_seri[sembol].pencere(t, 100, 0.0)
+            if u4:
+                usd = (_trend_yonu(u4["kapanis"]), coin_verileri[sembol].get("usd_sembol"))
+        return derin_analiz_hesapla(sembol, h1, h4, d1, m15, btc, usd)
+
+    t = bas_ms - bas_ms % ARALIK_MS["15m"]
+    while t < bitis_ms:
+        t_kapanis = t + ARALIK_MS["15m"]
+        for sembol, indeks in idx15.items():
+            i = indeks.get(t)
+            if i is None:
+                continue
+            son_fiyat[sembol] = coin_verileri[sembol]["15m"]["kapanis"][i]
+            if sembol in acik:
+                cikislari_isle(sembol, i, t_kapanis)
+        t = t_kapanis
+        if t % ARALIK_MS["1h"] != 0:
+            continue
+
+        # ---- saat basi: risk kontrolleri ve yeni giris karari ----
+        simdi = datetime.fromtimestamp(t / 1000)
+        deger = portfoy()
+        sayac["toplam_saat"] += 1
+        sayac["acik_saat"] += bool(acik)
+        zirve = max(zirve, deger)
+        en_derin = max(en_derin, (zirve - deger) / zirve if zirve > 0 else 0.0)
+        risk.portfoy_guncelle(deger, simdi)
+        if risk.zirveden_dusus(deger) >= MAX_DRAWDOWN_PCT:
+            for sembol in list(acik):
+                sat(sembol, 0, son_fiyat[sembol], "ACIL-TASFIYE", t, True)
+            sayac["acil_fren"] = True
+            break
+        if simdi.hour == 0:
+            risk.temizle(simdi)
+        engel = risk.yeni_alim_engeli(deger, simdi)
+        if engel and engel[0] == "GUNLUK":
+            sayac["gunluk_limit_gunleri"].add(simdi.strftime("%Y-%m-%d"))
+        son_engel = engel[0] if engel else None
+        btc = btc_durumu(t)
+        izin, hedef_tutar, _ = dinamik_pozisyon_planla(nakit, deger, None, btc.get("rejim"))
+        if engel or izin <= len(acik):
+            continue
+        adaylar = []
+        for sembol in seri:
+            if sembol in acik or son_fiyat.get(sembol) is None or risk.coin_engel_bitisi(sembol, simdi):
+                continue
+            kapanis = son_kapanis.get(sembol)
+            if kapanis and t - kapanis[0] < _cooldown_suresi_hesapla(kapanis[1]) * 60_000:
+                continue
+            a = analiz(sembol, t, btc)
+            if a.get("gecti"):
+                adaylar.append(a)
+        if not adaylar:
+            continue
+        a = max(adaylar, key=lambda x: x["skor"])
+        sembol, fiyat = a["symbol"], son_fiyat[a["symbol"]]
+        tutar = risk_bazli_tutar(deger, giris_stop_pct(fiyat, a, None),
+                                 min(hedef_tutar, nakit / (1 + KOMISYON_PCT)))
+        if tutar <= 0 or tutar > nakit:
+            continue
+        giris = fiyat * (1 + BACKTEST_SLIPAJ_PCT)
+        stop_pct = giris_stop_pct(giris, a, None)
+        kom = tutar * KOMISYON_PCT
+        nakit -= tutar + kom
+        sayac["komisyon"] += kom
+        miktar = tutar / giris
+        lv = GridLevel(price=giris, has_position=True, buy_qty=miktar, buy_price=giris, en_yuksek_fiyat=giris,
+                       risk_birimi=giris * stop_pct, ilk_stop=giris * (1 - stop_pct),
+                       atr_giris=a.get("atr_1h") or giris * stop_pct / R_STOP_ATR_KATSAYI)
+        acik[sembol] = {"level": lv, "giris_ms": t, "tutar": tutar, "miktar0": miktar, "pnl": -kom,
+                        "analiz": giris_analiz_ozeti(a)}
+
+    for sembol in list(acik):
+        sat(sembol, 0, son_fiyat[sembol], "TEST-SONU", min(t, bitis_ms), True)
+    bitis = nakit
+    return {"baslangic": sermaye, "bitis": bitis, "islemler": islemler, "en_derin_dusus": en_derin,
+            "sayac": sayac, "son_engel": son_engel}
+
+
+def backtest_coinlerini_sec(sayi: int) -> list:
+    """Son 24 saatte en cok islem goren TRY pariteleri (stabil coinler haric)."""
+    req = urllib.request.Request(TICKER_24H_URL, headers={"User-Agent": "project-aurelius-bot"})
+    veri = http_istek_yap(req, timeout=20)
+    adaylar = []
+    for d in veri if isinstance(veri, list) else []:
+        sembol = d.get("symbol", "")
+        if not sembol.endswith("TRY") or sembol[:-3] in STABIL_COINLER:
+            continue
+        try:
+            adaylar.append((float(d.get("quoteVolume") or 0), sembol))
+        except (TypeError, ValueError):
+            continue
+    return [s for _, s in sorted(adaylar, reverse=True)[:sayi] if _ > 0]
+
+
+def _backtest_verisini_indir(semboller: list, bas_ms: int, bitis_ms: int) -> tuple:
+    coin_verileri, toplam = {}, len(semboller)
+    for n, sembol in enumerate(semboller, start=1):
+        print(f"  [{n}/{toplam}] {sembol} gecmis mumlari indiriliyor...", flush=True)
+        v = {}
+        try:
+            for aralik in ("15m", "1h", "4h", "1d"):
+                v[aralik] = gecmis_mumlari_getir(sembol, aralik, bas_ms - ISINMA_MUM[aralik] * ARALIK_MS[aralik],
+                                                 bitis_ms)
+        except Exception as e:
+            print(f"{YELLOW}    {sembol} atlandi (veri alinamadi: {e}){RESET}")
+            continue
+        if not v.get("15m") or not v.get("1h") or not v.get("4h"):
+            print(f"{YELLOW}    {sembol} atlandi (yeterli gecmis yok){RESET}")
+            continue
+        usd = sembol[:-3] + "USDT"
+        try:
+            v["usd4h"] = gecmis_mumlari_getir(usd, "4h", bas_ms - 100 * ARALIK_MS["4h"], bitis_ms)
+            v["usd_sembol"] = usd if v["usd4h"] else None
+        except Exception:
+            v["usd4h"], v["usd_sembol"] = None, None
+        coin_verileri[sembol] = v
+    btc_verisi = None
+    for sembol in BTC_ANALIZ_SEMBOLLERI:
+        try:
+            btc_verisi = {"sembol": sembol, **{a: gecmis_mumlari_getir(sembol, a, bas_ms - ISINMA_MUM[a] * ARALIK_MS[a],
+                                                                       bitis_ms) for a in ("1h", "4h", "1d")}}
+            if btc_verisi["1h"] and btc_verisi["4h"]:
+                break
+        except Exception as e:
+            print(f"{YELLOW}  {sembol} verisi alinamadi: {e}{RESET}")
+        btc_verisi = None
+    return coin_verileri, btc_verisi
+
+
+def _donem_degisimi(veri: Optional[dict], bas_ms: int) -> Optional[float]:
+    """Test donemi basindan sonuna kapanis fiyati degisimi (%)."""
+    if not veri or not veri.get("zaman"):
+        return None
+    i = bisect.bisect_left(veri["zaman"], bas_ms)
+    if i >= len(veri["zaman"]) or not veri["kapanis"][i]:
+        return None
+    return (veri["kapanis"][-1] / veri["kapanis"][i] - 1) * 100
+
+
+def backtest_raporu_satirlari(sonuc: dict, gun: int, coin_verileri: dict, btc_verisi: Optional[dict],
+                              bas_ms: int) -> list:
+    bas, bit = sonuc["baslangic"], sonuc["bitis"]
+    s = sonuc["sayac"]
+    degisimler = [d for d in (_donem_degisimi(v.get("15m"), bas_ms) for v in coin_verileri.values()) if d is not None]
+    btc_degisim = _donem_degisimi((btc_verisi or {}).get("1h"), bas_ms)
+    satirlar = [
+        f"Donem: son {gun} gun ({datetime.fromtimestamp(bas_ms / 1000).strftime('%d.%m.%Y')} - bugun) | "
+        f"{len(coin_verileri)} coin",
+        f"Sonuc: {bas:,.2f} -> {bit:,.2f} TRY ({bit - bas:+,.2f} TRY, %{(bit / bas - 1) * 100:+.2f})",
+        f"En derin dusus: %{sonuc['en_derin_dusus'] * 100:.1f} | odenen komisyon: {s['komisyon']:,.2f} TRY | "
+        f"pozisyonda gecen sure: %{s['acik_saat'] / max(1, s['toplam_saat']) * 100:.0f}",
+    ] + islem_ozeti_satirlari(sonuc["islemler"]) + [
+        f"Kiyas: test edilen coinler ayni donemde ortalama %{_ortalama(degisimler):+.1f}"
+        + (f", BTC (USDT) %{btc_degisim:+.1f}" if btc_degisim is not None and btc_verisi
+           and btc_verisi.get("sembol") == "BTCUSDT" else
+           f", BTC (TRY) %{btc_degisim:+.1f}" if btc_degisim is not None else ""),
+        f"Risk korumasi: gunluk limit {len(s['gunluk_limit_gunleri'])} gun, kayip molasi {s['mola']} kez, "
+        f"coin engeli {s['coin_engeli']} kez" + (" | ACIL FREN devreye girdi, test durdu" if s["acil_fren"] else ""),
+    ]
+    return satirlar
+
+
+def _backtest_argumanlari(argumanlar: list) -> tuple:
+    sayilar, semboller = [], None
+    for a in argumanlar:
+        try:
+            sayilar.append(float(a.replace(",", ".")))
+        except ValueError:
+            semboller = [x if x.endswith("TRY") else x + "TRY"
+                         for x in (p.strip().upper() for p in a.split(",")) if x]
+    gun = int(_aralikta(sayilar[0], *BACKTEST_GUN_ARALIGI)) if sayilar else BACKTEST_VARSAYILAN_GUN
+    sermaye = sayilar[1] if len(sayilar) > 1 and sayilar[1] > 0 else BACKTEST_VARSAYILAN_SERMAYE
+    return gun, sermaye, semboller
+
+
+def backtest_komutu(argumanlar: list) -> int:
+    """'backtest [GUN] [SERMAYE] [SEMBOLLER]' - orn. 'backtest 90 1000' veya 'backtest 60 1000 PEPETRY,SOLTRY'."""
+    gun, sermaye, semboller = _backtest_argumanlari(argumanlar)
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - BACKTEST MODU (v19)'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v20 - GECMIS VERI TESTI'.center(74)}{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"  Sembol: {symbol}   |   Test edilen sure: son {gun} gun (1 saatlik mumlarla)   |   Sermaye: {sermaye:,.2f} TRY\n")
-    print(f"{YELLOW}  NOT: Backtest, ORIJINAL coklu-seviye grid davranisini kullanir "
-          f"(tek_pozisyon_modu=False) - MAX_OPEN_POSITIONS/cooldown/CANLI_MOD burada gecerli "
-          f"degildir, bu mod SADECE grid parametrelerinin TARIHSEL kalitesini test eder "
-          f"(her zaman simulasyon, Telegram bildirimi gondermez).{RESET}\n")
-
+    print(f"  Son {gun} gun, {sermaye:,.0f} TL sanal sermaye. Emir gonderilmez; birkac dakika surebilir.\n")
+    bitis_ms = int(time.time() * 1000) // ARALIK_MS["1h"] * ARALIK_MS["1h"]
+    bas_ms = bitis_ms - gun * ARALIK_MS["1d"]
     try:
-        fiyatlar = gecmis_fiyatlari_getir(symbol, gun)
+        semboller = semboller or backtest_coinlerini_sec(BACKTEST_COIN_SAYISI)
     except Exception as e:
-        print(f"{RED}Gecmis veri alinamadi: {e}{RESET}")
-        return
-
-    if len(fiyatlar) < 10:
-        print(f"{RED}Yeterli gecmis veri bulunamadi ({len(fiyatlar)} mum).{RESET}")
-        return
-
-    print(f"  {len(fiyatlar)} adet kapanis fiyati bulundu. Ilk fiyat: {fiyatlar[0]:,.4f} TRY, "
-          f"son fiyat: {fiyatlar[-1]:,.4f} TRY\n")
-
-    bot = CoinBot(
-        symbol=symbol,
-        coin_name=_coin_adi(symbol),
-        width_pct=VARSAYILAN_WIDTH_PCT,
-        grid_count=VARSAYILAN_GRID_SAYISI,
-        starting_try=sermaye,
-        tek_pozisyon_modu=False,
-        bildirim_aktif=False,  # v10: backtest Telegram'a spam atmaz
-    )
-    bot.setup_grid(fiyatlar[0])
-    bot.opening_fill(fiyatlar[0])
-
-    en_yuksek_portfoy = sermaye
-    en_derin_dusus_pct = 0.0
-
-    for fiyat in fiyatlar[1:]:
-        bot.last_real_price = fiyat
-        bot.stop_loss_kontrol(fiyat, sim=False)
-        bot.evaluate(fiyat, sim=False)
-
-        anlik_portfoy = bot.cash_try + bot.coin_qty * fiyat
-        if anlik_portfoy > en_yuksek_portfoy:
-            en_yuksek_portfoy = anlik_portfoy
-        dusus_pct = (en_yuksek_portfoy - anlik_portfoy) / en_yuksek_portfoy if en_yuksek_portfoy > 0 else 0
-        if dusus_pct > en_derin_dusus_pct:
-            en_derin_dusus_pct = dusus_pct
-
-    son_fiyat = fiyatlar[-1]
-    bot.tasfiye_et(son_fiyat)
-
-    portfoy = bot.cash_try
-    pnl = portfoy - sermaye
-    pnl_pct = (pnl / sermaye) * 100
-    pnl_color = GREEN if pnl >= 0 else RED
-
+        print(f"{RED}Coin listesi alinamadi: {e}{RESET}")
+        return CIKIS_DUR
+    coin_verileri, btc_verisi = _backtest_verisini_indir(semboller, bas_ms, bitis_ms)
+    if not coin_verileri:
+        print(f"{RED}Hicbir coin icin gecmis veri alinamadi (internet / Binance TR erisimini kontrol edin).{RESET}")
+        return CIKIS_DUR
+    print(f"\n  Simulasyon calisiyor ({len(coin_verileri)} coin x {gun * 24} saat)...", flush=True)
+    sonuc = backtest_simule_et(coin_verileri, btc_verisi, bas_ms, bitis_ms, sermaye)
+    try:
+        if os.path.exists(BACKTEST_ISLEMLERI_CSV):
+            os.remove(BACKTEST_ISLEMLERI_CSV)
+        for kayit in sonuc["islemler"]:
+            islem_gunlugune_yaz(kayit, BACKTEST_ISLEMLERI_CSV)
+    except OSError as e:
+        print(f"{YELLOW}  Islem listesi yazilamadi: {e}{RESET}")
     print(f"\n{CYAN}{'-' * 74}{RESET}")
-    print(f"{BOLD}  BACKTEST SONUCU{RESET}")
+    print(f"{BOLD}  SONUC{RESET}")
     print(f"{CYAN}{'-' * 74}{RESET}")
-    print(f"  Baslangic sermayesi : {sermaye:,.2f} TRY")
-    print(f"  Bitis sermayesi     : {portfoy:,.2f} TRY")
-    print(f"  Kar/Zarar           : {pnl_color}{pnl:+,.2f} TRY ({pnl_pct:+.2f}%){RESET}")
-    print(f"  Toplam islem sayisi : {bot.trade_count} adet (alim+satim)")
-    print(f"  Odenen toplam komisyon: {bot.toplam_komisyon:,.2f} TRY")
-    print(f"  En derin dusus (max drawdown): %{en_derin_dusus_pct * 100:.2f}")
-    print(f"{CYAN}{'=' * 74}{RESET}\n")
-    print(f"{YELLOW}  Not: Bu bir GECMIS VERIYLE simulasyondur, gelecekteki performansi garanti etmez.{RESET}")
+    for satir in backtest_raporu_satirlari(sonuc, gun, coin_verileri, btc_verisi, bas_ms):
+        print(f"  {satir}")
+    print(f"{CYAN}{'-' * 74}{RESET}")
+    print(f"{GRAY}  Varsayimlar: komisyon %{KOMISYON_PCT * 100:g} + kayma %{BACKTEST_SLIPAJ_PCT * 100:.3g} (her alim/satim), "
+          f"15 dk'lik mumlar;\n  ayni mumda hem stop hem hedef varsa once stop sayildi (temkinli); spread/emir reddi "
+          f"simule edilmedi;\n  coinler bugunun en hacimli TRY pariteleri (o donemde listede olmayabilirler).{RESET}")
+    print(f"{GRAY}  Islemlerin tamami: {BACKTEST_ISLEMLERI_CSV}{RESET}")
+    print(f"{YELLOW}  Gecmis sonuc gelecegi garanti etmez.{RESET}\n")
+    return CIKIS_DUR
+
+
+def rapor_komutu() -> int:
+    """'rapor': islem gunlugunun tum zamanlar ve son 30 gun ozeti."""
+    tumu = islem_gunlugunu_oku()
+    print(f"{BOLD}ISLEM GUNLUGU OZETI{RESET} ({ISLEM_GUNLUGU_CSV})\n")
+    for baslik, kayitlar in (("Tum zamanlar", tumu), ("Son 30 gun", islem_gunlugunu_oku(gun=30))):
+        print(f"{BOLD}{baslik}{RESET}")
+        for satir in islem_ozeti_satirlari(kayitlar):
+            print(f"  {satir}")
+        print()
+    return CIKIS_DUR
 
 
 def analiz_komutu(sembol: Optional[str]) -> int:
-    """'python project_aurelius_bot_v19.py analiz [SEMBOL]': botun bir coini nasil
+    """'python project_aurelius_bot_v20.py analiz [SEMBOL]': botun bir coini nasil
     degerlendirdigini gosterir (emir gondermez, anahtar gerektirmez)."""
     print(f"{BOLD}DETAYLI ANALIZ{RESET}")
     btc = btc_rejim_analizi(zorla=True)
@@ -5259,11 +6106,9 @@ def main():
     komut = sys.argv[1].lower() if len(sys.argv) > 1 else ""
     try:
         if komut == "backtest":
-            symbol = sys.argv[2].upper() if len(sys.argv) > 2 else "BTCTRY"
-            gun = int(sys.argv[3]) if len(sys.argv) > 3 else 30
-            sermaye = float(sys.argv[4]) if len(sys.argv) > 4 else None
-            backtest_calistir(symbol, gun, sermaye)
-            kod = CIKIS_DUR
+            kod = backtest_komutu(sys.argv[2:])
+        elif komut == "rapor":
+            kod = rapor_komutu()
         elif komut == "baglanti":
             baglanti_testi()
             kod = CIKIS_DUR
