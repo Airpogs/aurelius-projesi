@@ -1,13 +1,32 @@
 """
-PROJECT AURELIUS - v18
+PROJECT AURELIUS - v19
 Binance TR AKILLI SECIM Grid Trading Bot - PIYASA ADAPTIF MOTOR VE OTONOM SERMAYE DONGUSU
 ======================================================================
+v19 - DETAYLI ANALIZ VE R TABANLI KAR ALMA:
+  GIRIS: Bot bir coine girmeden once onu gunluk, 4 saatlik, 1 saatlik ve 15
+  dakikalik mumlarla (her birinde ~200 kapanmis mum) inceler:
+   - Zorunlu kurallar: gunluk dusus trendi yok; 4s trend yukari (EMA20>EMA50,
+     fiyat EMA50 ustunde) ve guclu (4s ADX>=20, +DI>-DI); 1s ADX>=20 ve 1s'te
+     geri cekilme bitmis (MACD guclenen veya fiyat EMA20 ustunde); 1s RSI 38-60, 4s RSI<=72;
+     15dk'da asiri yukselis yok; en yakin dirence en az 1.5R alan var; USDT
+     paritesinde dusus yok (TRY yukselisi lira kaynakli olmasin); BTC riskli
+     degil; BTC zayifken BTC'ye bagli (korelasyon>=0.6) coine girilmez.
+   - Puan (0-100): trend 30, ivme (MACD/RSI) 20, hacim (goreceli hacim, OBV,
+     alici payi) 20, kar alani 15, BTC 10, USDT trendi 5. Min puan 55
+     (AURELIUS_MIN_SKOR ile degistirilebilir). En yuksek puanliya girilir.
+  BTC REJIMI: gunluk/4s trend, 4s ADX yonu, son 4s/24s degisim ve oynaklikla
+  GUCLU (tam kapasite) / NOTR, ZAYIF (yarim) / RISKLI (yeni alim yok).
+  CIKIS (R = giris ile stop arasi): stop destegin alti veya 1.5xATR (%2-6);
+  +1R'de 1/3 satilir ve stop basa-basa; +2R'de kalanin yarisi satilir ve stop
+  +1R'ye kilitlenir; son kisim zirve-2.5xATR takip eden stopla, ust sinir yok.
+  v18 pozisyonlari otomatik aktarilir (1R = eski %4 stop).
+  KOMUTLAR: 'analiz SEMBOL' (konsol), /analiz SEMBOL ve /btc (Telegram).
 v18 - KESINTI ONLEMLERI (bot kapaliyken pozisyonlar korumasiz kalmasin):
   1) Durum bildirimi: AURELIUS_DURUM_BILDIRIM_SAAT (varsayilan 2, 0=kapali)
      saatte bir Telegram'a portfoy ozeti. AURELIUS_SAGLIK_URL verilirse
      (orn. healthchecks.io ping adresi) 5 dk'da bir "calisiyorum" sinyali;
      sinyal kesilirse (elektrik kesintisi dahil) o servis size haber verir.
-  2) Otomatik yeniden baslatma: 'python project_aurelius_bot_v18.py kurulum'
+  2) Otomatik yeniden baslatma: 'python project_aurelius_bot_v19.py kurulum'
      bu penceredeki ayarlarla baslat.bat (Linux: baslat.sh) olusturur; bot
      coker/baslayamazsa 60 sn sonra yeniden baslar. Istege bagli: Windows
      oturumu acilinca otomatik baslatma. Cikis kodlari: 0 bilincli durdurma,
@@ -463,8 +482,9 @@ YAPMAZ; her emir tek seferde MARKET emri olarak gonderilir ve sonucu
 dogrudan API yanitindan okunur.
 
 Kullanim:
-    python project_aurelius_bot_v18.py                          (canli/simulasyon - CANLI_MOD bayragina gore)
-    python project_aurelius_bot_v18.py backtest SEMBOL GUN [SERMAYE]  (backtest - her zaman simulasyon)
+    python project_aurelius_bot_v19.py                          (canli/simulasyon - CANLI_MOD bayragina gore)
+    python project_aurelius_bot_v19.py backtest SEMBOL GUN [SERMAYE]  (backtest - her zaman simulasyon; ESKI v8/v9 grid mantigi)
+    python project_aurelius_bot_v19.py analiz [SEMBOL]          (detayli analiz raporu, emir gondermez)
 """
 
 import time
@@ -1177,6 +1197,11 @@ def durumu_kaydet(kasa: "MerkeziKasa", pozisyonlar: dict, rapor: "RaporlamaDurum
                         "borsa_stop_emir_id": lvl.borsa_stop_emir_id,  # v18
                         "borsa_stop_fiyati": lvl.borsa_stop_fiyati,
                         "borsa_stop_miktari": lvl.borsa_stop_miktari,
+                        "risk_birimi": lvl.risk_birimi,  # v19
+                        "ilk_stop": lvl.ilk_stop,
+                        "atr_giris": lvl.atr_giris,
+                        "tp1_alindi": lvl.tp1_alindi,
+                        "tp2_alindi": lvl.tp2_alindi,
                     }
                     for lvl in b.grid
                 ],
@@ -1289,9 +1314,24 @@ def durumdan_kasa_ve_pozisyonlar_olustur(veri: dict):
                 borsa_stop_emir_id=lvl.get("borsa_stop_emir_id"),  # v18
                 borsa_stop_fiyati=lvl.get("borsa_stop_fiyati", 0.0),
                 borsa_stop_miktari=lvl.get("borsa_stop_miktari", 0.0),
+                risk_birimi=lvl.get("risk_birimi", 0.0),  # v19
+                ilk_stop=lvl.get("ilk_stop", 0.0),
+                atr_giris=lvl.get("atr_giris", 0.0),
+                tp1_alindi=lvl.get("tp1_alindi", False),
+                tp2_alindi=lvl.get("tp2_alindi", False),
             )
             for lvl in p.get("grid", [])
         ]
+        for lvl in b.grid:
+            if lvl.has_position and lvl.risk_birimi <= 0 and lvl.buy_price > 0:
+                # v19: v18 ve oncesinde acilmis pozisyonu yeni sisteme aktar:
+                # eski sabit %4 stop = 1R; kismi kar alindiysa hedef 1 alinmis sayilir.
+                lvl.risk_birimi = lvl.buy_price * STOP_LOSS_PCT
+                lvl.ilk_stop = lvl.buy_price - lvl.risk_birimi
+                lvl.atr_giris = lvl.risk_birimi / R_STOP_ATR_KATSAYI
+                lvl.tp1_alindi = lvl.kismi_kar_alindi
+                print(f"{CYAN}  {sym}: onceki surumde acilan pozisyon yeni kar alma sistemine aktarildi "
+                      f"(1R = %{STOP_LOSS_PCT * 100:.0f}).{RESET}")
         pozisyonlar[sym] = b
 
     acik_sayisi = sum(1 for b in pozisyonlar.values() if b.has_open_position)
@@ -1421,7 +1461,7 @@ def _ag_hatasi_ipucu(hata: Exception) -> None:
         f"Python'un kullandigi proxy: {proxyler or 'yok'}",
         "Ne yapmali: VPN'i kapatip/acip, antivirusun HTTPS taramasini gecici kapatip veya",
         "baska bir aga (orn. telefon hotspot) gecip tekrar deneyin. Ayrintili teshis icin:",
-        "    python project_aurelius_bot_v18.py baglanti",
+        "    python project_aurelius_bot_v19.py baglanti",
     ]
     if proxyler:
         satirlar.append("Proxy'yi bu pencerede devre disi birakmak icin:  set NO_PROXY=*")
@@ -1463,7 +1503,7 @@ def _ham_yanit_ozeti(ham: bytes) -> str:
 
 def baglanti_testi() -> None:
     """
-    'python project_aurelius_bot_v18.py baglanti' ile calisir. API anahtari
+    'python project_aurelius_bot_v19.py baglanti' ile calisir. API anahtari
     GEREKTIRMEZ, emir GONDERMEZ. Binance TR'ye giden yolu adim adim test
     eder (DNS -> TLS el sikisma -> ozel API sunucusu -> piyasa verisi
     sunucusu) ve sorunun nerede oldugunu gosterir.
@@ -2082,6 +2122,11 @@ class GridLevel:
     borsa_stop_son_islem: float = 0.0   # kaydedilmez: son kurma/iptal zamani (monotonic)
     borsa_stop_son_sorgu: float = 0.0   # kaydedilmez: son durum sorgusu (monotonic)
     borsa_stop_hata_sayisi: int = 0     # kaydedilmez
+    risk_birimi: float = 0.0            # v19: 1R (giris - ilk stop), fiyat cinsinden
+    ilk_stop: float = 0.0
+    atr_giris: float = 0.0              # giristeki ATR(1s) - takip eden stop mesafesi
+    tp1_alindi: bool = False
+    tp2_alindi: bool = False
 
 
 def _cooldown_suresi_hesapla(tag: str) -> float:
@@ -2100,11 +2145,13 @@ def _cooldown_suresi_hesapla(tag: str) -> float:
     grubuna (15dk) DEGIL. ACIL-TASFIYE de (portfoy capinda acil fren)
     aynı temkinli gruba alindi.
     """
-    if tag in ("KAR-AL", "TRAILING-STOP"):
+    if tag in ("KAR-AL", "TRAILING-STOP", "KAR-KILIDI-STOP"):
         return COOLDOWN_KAR_DAKIKA
-    if tag == "ZAMAN-ASIMI":
+    if tag in ("ZAMAN-ASIMI", "BREAKEVEN-STOP"):
+        # v19: basa-bas stopu artik hedef 1 alindiktan SONRA devreye girer
+        # (islem toplamda karli) - zarar grubunda degil, notr grupta.
         return COOLDOWN_ZAMAN_ASIMI_DAKIKA
-    if tag in ("STOP-LOSS", "BREAKEVEN-STOP", "ACIL-TASFIYE", "BORSA-STOP", "MANUEL-KAPANIS"):
+    if tag in ("STOP-LOSS", "ACIL-TASFIYE", "BORSA-STOP", "MANUEL-KAPANIS"):
         return COOLDOWN_ZARAR_DAKIKA
     return COOLDOWN_MINUTES  # bilinmeyen etiket icin guvenli varsayilan
 
@@ -2131,7 +2178,8 @@ def kademe_kapasitesi_hesapla(toplam_kasa: float) -> int:
     return KASA_KAPASITESI_TAVAN
 
 
-def dinamik_pozisyon_planla(kasa_bakiye: float, toplam_kasa: float, btc_degisim: Optional[float]):
+def dinamik_pozisyon_planla(kasa_bakiye: float, toplam_kasa: float, btc_degisim: Optional[float],
+                            btc_rejimi: Optional[str] = None):
     """
     v17 MODUL 1: KASAYA GORE ADAPTIF SERMAYE VE SNIPER MODU. Her tick'te
     GUNCEL toplam kasaya (serbest nakit + acik pozisyonlarin piyasa
@@ -2162,7 +2210,13 @@ def dinamik_pozisyon_planla(kasa_bakiye: float, toplam_kasa: float, btc_degisim:
         # v17: BTC sert dususteyse KASA NE OLURSA OLSUN %100 nakit koruma
         return 0, 0.0, sniper_modu_aktif
 
-    if btc_degisim is None:
+    if btc_rejimi == "RISKLI":
+        return 0, 0.0, sniper_modu_aktif  # v19: detayli BTC analizi riskli -> yeni alim yok
+
+    if btc_rejimi in ("GUCLU", "NOTR", "ZAYIF"):
+        # v19: detayli BTC rejimi varsa 24s degisim yerine o kullanilir
+        izin_verilen = temel_kapasite if btc_rejimi == "GUCLU" else max(1, temel_kapasite // 2)
+    elif btc_degisim is None:
         izin_verilen = max(1, temel_kapasite // 2)  # veri yok - temkinli/savunma modu
     elif btc_degisim > BTC_GUCLU_YUKSELIS_PCT:
         izin_verilen = temel_kapasite  # BTC guclu yukseliste -> tam kapasite
@@ -2203,21 +2257,27 @@ def en_kaliteli_aday_belirle(bilgi_map: dict, pozisyonlar: dict) -> Optional[str
     (evaluate_v9) YENI ALIM yapmaz, sermaye nakitte bekletilir.
     """
     en_iyi_sym: Optional[str] = None
-    en_iyi_adx = -1.0
+    en_iyi_anahtar = None
     for sym, bilgi in bilgi_map.items():
-        adx14 = bilgi.get("adx14")
-        rsi14 = bilgi.get("rsi14")
-        if adx14 is None or rsi14 is None:
-            continue
-        if adx14 < ADX_MIN_ESIK:
-            continue
-        if not (RSI_KALITE_ALT_ESIK <= rsi14 <= RSI_KALITE_UST_ESIK):
-            continue
         bot = pozisyonlar.get(sym)
         if bot is not None and (bot.has_open_position or bot.cooldown_aktif_mi() or bot.bekliyor):
             continue
-        if adx14 > en_iyi_adx:
-            en_iyi_adx = adx14
+        derin = bilgi.get("derin")
+        if derin is not None:
+            # v19: detayli analizden GECMEYEN coine asla girilmez; gecenler puana gore
+            if not derin.get("gecti"):
+                continue
+            anahtar = (1, derin.get("skor", 0.0))
+        else:
+            adx14 = bilgi.get("adx14")
+            rsi14 = bilgi.get("rsi14")
+            if adx14 is None or rsi14 is None or adx14 < ADX_MIN_ESIK:
+                continue
+            if not (RSI_KALITE_ALT_ESIK <= rsi14 <= RSI_KALITE_UST_ESIK):
+                continue
+            anahtar = (0, adx14)
+        if en_iyi_anahtar is None or anahtar > en_iyi_anahtar:
+            en_iyi_anahtar = anahtar
             en_iyi_sym = sym
     return en_iyi_sym
 
@@ -2409,11 +2469,35 @@ class CoinBot:
                           f"{html.escape(str(e))}")
             return None
 
+    def _r_stop_hesapla(self, level: "GridLevel") -> tuple:
+        """v19: R tabanli stop (asla asagi inmez): ilk stop -> hedef 1 sonrasi
+        basa-bas -> takip eden stop (zirve - k x ATR) -> hedef 2 sonrasi +1R kilidi.
+        Donus: (stop_seviyesi, etiket)."""
+        b, r = level.buy_price, level.risk_birimi
+        stop, etiket = (level.ilk_stop or b - r), "STOP-LOSS"
+        if level.tp1_alindi:
+            basa_bas = b * (1 + 3 * (KOMISYON_PCT + SLIPAJ_MAKS_PCT))
+            if basa_bas > stop:
+                stop, etiket = basa_bas, "BREAKEVEN-STOP"
+            katsayi = (CHANDELIER_SIKI_ATR_KATSAYI if level.en_yuksek_fiyat >= b + CHANDELIER_SIKI_R * r
+                       else CHANDELIER_ATR_KATSAYI)
+            takip = level.en_yuksek_fiyat - katsayi * (level.atr_giris or r / R_STOP_ATR_KATSAYI)
+            if takip > stop:
+                stop, etiket = takip, "TRAILING-STOP"
+        if level.tp2_alindi:
+            kilit = b + TP2_SONRASI_KILIT_R * r
+            if kilit > stop:
+                stop, etiket = kilit, "KAR-KILIDI-STOP"
+        return stop, etiket
+
     def _ratchet_stop_hesapla(self, level: "GridLevel") -> tuple:
         """v14: UC KADEMELI RATCHET STOP hesabini SALT-OKUNUR olarak
         dondurur (islem yapmaz) - hem stop_loss_kontrol() icinde HEM DE
         raporlama/giris karti icin (guncel_stop_seviyesi gostermek icin)
-        tekrar kullanilir. Donus: (stop_seviyesi, etiket)."""
+        tekrar kullanilir. Donus: (stop_seviyesi, etiket).
+        v19: R bilgisi olan (canli) pozisyonlarda _r_stop_hesapla kullanilir."""
+        if level.risk_birimi > 0:
+            return self._r_stop_hesapla(level)
         peak = level.en_yuksek_fiyat
         buy_price = level.buy_price
 
@@ -2456,6 +2540,13 @@ class CoinBot:
         (v14'teki 'Hedef < Stop' tutarsizligini onlemek icin - trailing
         aktifken zaten cikis o mekanizma tarafindan yonetilir)."""
         for i, level in enumerate(self.grid):
+            if level.has_position and level.risk_birimi > 0:
+                stop, etiket = self._r_stop_hesapla(level)
+                if not level.tp1_alindi:
+                    return level.buy_price + TP1_R * level.risk_birimi, stop, etiket
+                if not level.tp2_alindi:
+                    return level.buy_price + TP2_R * level.risk_birimi, stop, etiket
+                return "TRAILING", stop, etiket
             if level.has_position:
                 stop, etiket = self._ratchet_stop_hesapla(level)
                 if etiket == "TRAILING-STOP":
@@ -2762,6 +2853,10 @@ class CoinBot:
             if price > level.en_yuksek_fiyat:
                 level.en_yuksek_fiyat = price
 
+            if kasa is not None and level.risk_birimi > 0:
+                self._r_cikis_yonetimi(level, price, sim, kasa, acik_pozisyon_sayaci, rapor, durum_kaydet)
+                continue
+
             # v13: KADEMELI KAR ALMA - pozisyon KISMI_KAR_AL_PCT kara ulastiginda
             # (stop henuz tetiklenmeden) miktarin bir kismi ANINDA satilarak kar
             # erken realize edilir; kalan miktar mevcut breakeven/trailing
@@ -2811,6 +2906,47 @@ class CoinBot:
 
             if price <= stop_seviyesi:
                 self._satisi_uygula(level, price, etiket, sim, kasa, acik_pozisyon_sayaci, rapor, durum_kaydet)
+
+    def _r_cikis_yonetimi(self, level: "GridLevel", price: float, sim: bool, kasa: MerkeziKasa,
+                          acik_pozisyon_sayaci: Optional[list], rapor: Optional["RaporlamaDurumu"],
+                          durum_kaydet: Optional[object]) -> None:
+        """v19 KAR ALMA / ZARAR KESME:
+          1) +1R: pozisyonun 1/3'u satilir (KAR-AL-1), stop basa-basa cekilir
+          2) +2R: kalanin yarisi satilir (KAR-AL-2), stop +1R'ye kilitlenir
+          3) Kalan kisim zirve - 2.5 x ATR takip eden stopla yonetilir (ust sinir yok)
+          4) Hedef 1'e hic ulasamayan pozisyon 18 saatte kar < %1 ise kapatilir
+          5) Fiyat guncel stop'un altina inerse tamami satilir."""
+        b, r = level.buy_price, level.risk_birimi
+        if not level.tp1_alindi and price >= b + TP1_R * r:
+            if not self._satisi_uygula(level, price, "KAR-AL-1", sim, kasa, acik_pozisyon_sayaci, rapor,
+                                       durum_kaydet, miktar=level.buy_qty * TP1_ORAN):
+                print(f"[{ts()}] {YELLOW}{self.symbol} hedef 1 satisi gerceklesmedi (orn. tutar cok kucuk) - "
+                      f"atlandi; stop yine de basa-basa cekildi.{RESET}")
+            level.tp1_alindi = True
+            if not level.has_position:
+                return
+        if level.tp1_alindi and not level.tp2_alindi and price >= b + TP2_R * r:
+            if not self._satisi_uygula(level, price, "KAR-AL-2", sim, kasa, acik_pozisyon_sayaci, rapor,
+                                       durum_kaydet, miktar=level.buy_qty * TP2_ORAN):
+                print(f"[{ts()}] {YELLOW}{self.symbol} hedef 2 satisi gerceklesmedi - atlandi; stop +1R'ye "
+                      f"kilitlendi.{RESET}")
+            level.tp2_alindi = True
+            if not level.has_position:
+                return
+        if not level.tp1_alindi and self.alis_zamani is not None:
+            yas_saat = (datetime.now() - self.alis_zamani).total_seconds() / 3600
+            kar_pct = (price - b) / b if b else 0.0
+            if yas_saat >= MAKS_POZISYON_OMRU_SAAT and kar_pct < ZAMAN_ASIMI_KAR_ESIGI_PCT:
+                if self._satisi_uygula(level, price, "ZAMAN-ASIMI", sim, kasa, acik_pozisyon_sayaci, rapor,
+                                       durum_kaydet):
+                    print(f"[{ts()}] {YELLOW}\u23F3 {self.symbol} Zaman Asimi Cikisi: "
+                          f"{MAKS_POZISYON_OMRU_SAAT:.0f} saatte hedef 1'e ulasamadi, sermaye serbest birakildi.{RESET}")
+                    send_telegram(f"\u23F3 <b>{self.symbol} Zaman Asimi Cikisi</b>\n"
+                                  f"{MAKS_POZISYON_OMRU_SAAT:.0f} saatte hedef 1'e ulasamadigi icin kapatildi.")
+                    return
+        stop, etiket = self._r_stop_hesapla(level)
+        if price <= stop:
+            self._satisi_uygula(level, price, etiket, sim, kasa, acik_pozisyon_sayaci, rapor, durum_kaydet)
 
     # ------------------------------------------------------------
     # LEGACY (v8/v9) DEGERLENDIRME - SADECE BACKTEST icin (tek_pozisyon_modu=False)
@@ -2949,6 +3085,22 @@ class CoinBot:
                 if en_kaliteli_aday is None or self.symbol != en_kaliteli_aday:
                     continue
 
+                # v19: analizden sonra fiyat cok kactiysa veya stop'a dayandiysa girme
+                derin = (giris_bilgisi or {}).get("derin") or {}
+                if derin.get("gecti") and derin.get("fiyat"):
+                    analiz_riski = derin["fiyat"] - derin["stop_fiyati"]
+                    erteleme = None
+                    if price > derin["fiyat"] + KOVALAMA_MAKS_R * analiz_riski:
+                        erteleme = "fiyat analizden sonra hizla yukseldi (kovalanmaz)"
+                    elif price - derin["stop_fiyati"] < price * R_STOP_MIN_PCT:
+                        erteleme = "fiyat analizdeki stop seviyesine cok yaklasti"
+                    if erteleme:
+                        if getattr(self, "_son_erteleme", None) != (derin["fiyat"], erteleme):
+                            self._son_erteleme = (derin["fiyat"], erteleme)
+                            print(f"[{ts()}] {MAGENTA}{self.symbol:<9}{RESET} {YELLOW}ALIM ERTELENDI - "
+                                  f"{erteleme}; bir sonraki analiz beklenecek.{RESET}")
+                        continue
+
                 # v10 BOLUM 3: ALIM'dan hemen once tahta derinligi/spread kontrolu
                 spread_pct, en_iyi_bid, en_iyi_ask = orderbook_spread_kontrol(self.symbol)
                 if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
@@ -2981,6 +3133,18 @@ class CoinBot:
                 level.buy_qty = buy_qty
                 level.buy_price = exec_price
                 level.en_yuksek_fiyat = exec_price
+                # v19: R (risk birimi) - analizdeki destek/ATR stop'u, yoksa ATR tahmini
+                if derin.get("stop_fiyati"):
+                    stop_pct = (exec_price - derin["stop_fiyati"]) / exec_price
+                else:
+                    atr_tahmini = (giris_bilgisi or {}).get("atr14")
+                    stop_pct = R_STOP_ATR_KATSAYI * atr_tahmini / exec_price if atr_tahmini else STOP_LOSS_PCT
+                stop_pct = min(max(stop_pct, R_STOP_MIN_PCT), R_STOP_MAKS_PCT)
+                level.risk_birimi = exec_price * stop_pct
+                level.ilk_stop = exec_price - level.risk_birimi
+                level.atr_giris = (derin.get("atr_1h") or (giris_bilgisi or {}).get("atr14")
+                                   or level.risk_birimi / R_STOP_ATR_KATSAYI)
+                level.tp1_alindi = level.tp2_alindi = level.kismi_kar_alindi = False
                 self.alis_zamani = datetime.now()  # v16: zaman bazli bayat pozisyon cikisi icin
                 self.bu_turda_islem_yapildi = True
                 acik_pozisyon_sayaci[0] += 1
@@ -2994,9 +3158,13 @@ class CoinBot:
                 # v14/v17: SEFFAF GIRIS KARTI - hedef satis (bir sonraki grid
                 # seviyesi) ve stop-loss (taban) fiyatlarini, beklenen net
                 # kar/kayip TL ile birlikte gosterir.
-                hedef_fiyat = self._sonraki_kar_hedefi(i)
-                stop_fiyat = exec_price * (1 - STOP_LOSS_PCT)
-                satis_brut_tahmini = buy_qty * hedef_fiyat
+                # v19: hedef 1 (1/3), hedef 2 (1/3) ve kalan 1/3 icin temkinli +1R
+                # varsayimiyla beklenen net kar; zarar ilk stop'tan.
+                hedef1_fiyat = exec_price + TP1_R * level.risk_birimi
+                hedef_fiyat = exec_price + TP2_R * level.risk_birimi
+                stop_fiyat = level.ilk_stop
+                satis_brut_tahmini = buy_qty / 3 * (hedef1_fiyat + hedef_fiyat
+                                                    + exec_price + TP2_SONRASI_KILIT_R * level.risk_birimi)
                 satis_kom_tahmini = satis_brut_tahmini * KOMISYON_PCT
                 beklenen_net_kar = (satis_brut_tahmini - satis_kom_tahmini) - yatirim_tutari
                 stop_brut_tahmini = buy_qty * stop_fiyat
@@ -3011,11 +3179,15 @@ class CoinBot:
                     else f"Portfoy Modu ({acik_pozisyon_sayaci[0]}/{izin_verilen_pozisyon})"
                 )
 
-                gb = giris_bilgisi or {}
+                gb = dict(giris_bilgisi or {})
+                gb.update({k: derin[k] for k in ("ema50", "rsi14", "adx14") if derin.get(k) is not None})
+                analiz_ozeti = (f"puan {derin['skor']:.0f}/100 | 4s {derin.get('h4_trend')} | BTC {derin.get('btc_rejim')}"
+                                if derin.get("gecti") else None)
                 kart = giris_karti_olustur(
                     self.symbol, self.coin_name, gb.get("ema50"), gb.get("rsi14"), gb.get("adx14"),
                     buy_qty, exec_price, yatirim_tutari, hedef_fiyat, stop_fiyat,
                     beklenen_net_kar, beklenen_net_kayip, calisma_modu_etiketi,
+                    hedef1_fiyat=hedef1_fiyat, analiz_ozeti=analiz_ozeti,
                 )
                 print(f"{GREEN}{BOLD}\U0001F7E2 [YENI POZISYON ACILDI]{RESET}")
                 print(f"{CYAN}{kart}{RESET}\n")
@@ -3033,6 +3205,8 @@ class CoinBot:
                 # KAR-AL ile kapanabilir. v16: satis muhasebesi artik
                 # ortak _satisi_uygula() metodundan geciyor (dinamik
                 # cooldown otomatik uygulanir).
+                if level.risk_birimi > 0:
+                    continue  # v19: R tabanli pozisyonlarin cikislari stop_loss_kontrol'de
                 hedef_fiyat_bu_seviye = self._sonraki_kar_hedefi(i)
                 if price < hedef_fiyat_bu_seviye:
                     continue
@@ -3116,7 +3290,13 @@ def rsi_hesapla(kapanislar: list, periyot: int = 14):
 
 
 def adx_hesapla(highs: list, lows: list, closes: list, periyot: int = 14):
+    """v19: hesap adx_di_hesapla()'da; burada sadece ADX dondurulur."""
+    return adx_di_hesapla(highs, lows, closes, periyot)[0]
+
+
+def adx_di_hesapla(highs: list, lows: list, closes: list, periyot: int = 14) -> tuple:
     """
+    v19: (ADX, +DI, -DI). +DI > -DI yukari yonlu, tersi asagi yonlu trend.
     v13: ADX (Average Directional Index) - Wilder yontemiyle. Trend
     YONUNU degil GUCUNU olcer; ADX<20 tipik olarak yatay/whipsaw piyasa,
     ADX>25 belirgin trend olarak kabul edilir. RSI/EMA'nin sahte
@@ -3125,7 +3305,7 @@ def adx_hesapla(highs: list, lows: list, closes: list, periyot: int = 14):
     """
     n = len(closes)
     if n < periyot * 2 + 1:
-        return None
+        return None, None, None
 
     tr_list, plus_dm_list, minus_dm_list = [], [], []
     for i in range(1, n):
@@ -3139,7 +3319,7 @@ def adx_hesapla(highs: list, lows: list, closes: list, periyot: int = 14):
         minus_dm_list.append(minus_dm)
 
     if len(tr_list) < periyot * 2:
-        return None
+        return None, None, None
 
     smoothed_tr = sum(tr_list[:periyot])
     smoothed_plus_dm = sum(plus_dm_list[:periyot])
@@ -3160,13 +3340,15 @@ def adx_hesapla(highs: list, lows: list, closes: list, periyot: int = 14):
         dx_list.append(_dx(smoothed_tr, smoothed_plus_dm, smoothed_minus_dm))
 
     if len(dx_list) < periyot:
-        return None
+        return None, None, None
 
     adx = sum(dx_list[:periyot]) / periyot
     for i in range(periyot, len(dx_list)):
         adx = (adx * (periyot - 1) + dx_list[i]) / periyot
 
-    return adx
+    plus_di = (smoothed_plus_dm / smoothed_tr * 100) if smoothed_tr else 0.0
+    minus_di = (smoothed_minus_dm / smoothed_tr * 100) if smoothed_tr else 0.0
+    return adx, plus_di, minus_di
 
 
 def atr_hesapla(highs: list, lows: list, closes: list, periyot: int = 14):
@@ -3260,6 +3442,423 @@ def try_paritelerini_bul() -> list:
             semboller.append(s["symbol"])
 
     return sorted(set(semboller))
+
+
+# ==========================================================================
+# v19 BOLUM 1: COK ZAMAN DILIMLI PIYASA VERISI VE GOSTERGE KUTUPHANESI
+# ==========================================================================
+# Bot bir coine girmeden once onu gunluk / 4 saatlik / 1 saatlik / 15 dakikalik
+# mumlarla (her birinde ~200 KAPANMIS mum) inceler. Ayni veri tekrar tekrar
+# cekilmesin diye zaman dilimine gore onbellege alinir.
+MUM_SAYISI = 200
+MUM_ONBELLEK_SANIYE = {"15m": 120, "1h": 300, "4h": 900, "1d": 3600}
+_mum_onbellek: dict = {}
+_usd_paritesi_yok: set = set()
+
+
+def mumlari_getir(symbol: str, interval: str, limit: int = MUM_SAYISI) -> Optional[dict]:
+    """KAPANMIS mumlari dondurur; son (henuz kapanmamis) mum gostergelere
+    katilmaz, sadece 'son_fiyat' icin kullanilir. Anahtarlar: acilis, yuksek,
+    dusuk, kapanis, hacim, alici_hacim (piyasa emriyle alim hacmi), son_fiyat.
+    Veri yoksa None; ag/HTTP hatasi yukari iletilir."""
+    anahtar = (symbol, interval, limit)
+    simdi = time.time()
+    kayit = _mum_onbellek.get(anahtar)
+    if kayit is not None and simdi - kayit[0] < MUM_ONBELLEK_SANIYE.get(interval, 300):
+        return kayit[1]
+    url = KLINES_URL_TEMPLATE.format(symbol=symbol, interval=interval, limit=limit + 1)
+    req = urllib.request.Request(url, headers={"User-Agent": "project-aurelius-bot"})
+    data = http_istek_yap(req, timeout=20)
+    sonuc = None
+    if isinstance(data, list) and len(data) >= 2:
+        kapali = data[:-1]
+
+        def sutun(i):
+            return [float(m[i]) for m in kapali]
+
+        sonuc = {"acilis": sutun(1), "yuksek": sutun(2), "dusuk": sutun(3), "kapanis": sutun(4),
+                 "hacim": sutun(5), "alici_hacim": [float(m[9]) if len(m) > 9 else 0.0 for m in kapali],
+                 "son_fiyat": float(data[-1][4])}
+    _mum_onbellek[anahtar] = (simdi, sonuc)
+    return sonuc
+
+
+def ema_serisi(degerler: list, periyot: int) -> list:
+    """EMA serisi (ilk deger ilk 'periyot' degerin ortalamasi)."""
+    if len(degerler) < periyot:
+        return []
+    k = 2 / (periyot + 1)
+    ema = sum(degerler[:periyot]) / periyot
+    seri = [ema]
+    for deger in degerler[periyot:]:
+        ema = deger * k + ema * (1 - k)
+        seri.append(ema)
+    return seri
+
+
+def egim_pct(seri: list, geri: int = 5) -> Optional[float]:
+    """Serinin son 'geri' adimdaki yuzde degisimi (trendin egimi)."""
+    if len(seri) <= geri or not seri[-1 - geri]:
+        return None
+    return (seri[-1] / seri[-1 - geri] - 1) * 100
+
+
+def macd_histogram(kapanislar: list) -> Optional[tuple]:
+    """MACD(12,26,9) histogrami: (son, bir onceki). Pozitif ve buyuyorsa ivme yukari."""
+    e12, e26 = ema_serisi(kapanislar, 12), ema_serisi(kapanislar, 26)
+    if not e26:
+        return None
+    kayma = len(e12) - len(e26)
+    macd = [e12[i + kayma] - e26[i] for i in range(len(e26))]
+    sinyal = ema_serisi(macd, 9)
+    if len(sinyal) < 2:
+        return None
+    kayma2 = len(macd) - len(sinyal)
+    histogram = [macd[i + kayma2] - sinyal[i] for i in range(len(sinyal))]
+    return histogram[-1], histogram[-2]
+
+
+def goreceli_hacim(hacimler: list, pencere: int = 20) -> Optional[float]:
+    """Son kapanmis mumun hacmi / onceki 'pencere' mumun ortalama hacmi."""
+    if len(hacimler) < pencere + 1:
+        return None
+    ortalama = sum(hacimler[-pencere - 1:-1]) / pencere
+    return hacimler[-1] / ortalama if ortalama > 0 else None
+
+
+def obv_egimi(kapanislar: list, hacimler: list, pencere: int = 20) -> Optional[float]:
+    """Son 'pencere' mumdaki net OBV degisimi, ortalama hacim cinsinden
+    (pozitif: yukselen mumlarda daha cok hacim = alim baskisi)."""
+    if len(kapanislar) < pencere + 1:
+        return None
+    obv = 0.0
+    for i in range(len(kapanislar) - pencere, len(kapanislar)):
+        if kapanislar[i] > kapanislar[i - 1]:
+            obv += hacimler[i]
+        elif kapanislar[i] < kapanislar[i - 1]:
+            obv -= hacimler[i]
+    ortalama = sum(hacimler[-pencere:]) / pencere
+    return obv / ortalama if ortalama > 0 else None
+
+
+def alici_orani(hacimler: list, alici_hacimler: list, pencere: int = 6) -> Optional[float]:
+    """Son 'pencere' mumda piyasa emriyle ALIM yapanlarin hacim payi (0.5 ustu alici baskin)."""
+    toplam = sum(hacimler[-pencere:])
+    return sum(alici_hacimler[-pencere:]) / toplam if toplam > 0 else None
+
+
+def salinim_seviyeleri(yuksek: list, dusuk: list, pencere: int = 3, son: int = 120) -> tuple:
+    """Son 'son' mumdaki salinim (pivot) tepe ve dipleri: (direncler, destekler)."""
+    n = len(yuksek)
+    tepeler, dipler = [], []
+    for i in range(max(pencere, n - son), n - pencere):
+        if yuksek[i] == max(yuksek[i - pencere:i + pencere + 1]):
+            tepeler.append(yuksek[i])
+        if dusuk[i] == min(dusuk[i - pencere:i + pencere + 1]):
+            dipler.append(dusuk[i])
+    return tepeler, dipler
+
+
+def getiri_korelasyonu(a: list, b: list, pencere: int = 72) -> Optional[float]:
+    """Iki fiyat serisinin son 'pencere' mumluk getiri korelasyonu (-1..1)."""
+    if min(len(a), len(b)) < pencere + 1:
+        return None
+    a, b = a[-pencere - 1:], b[-pencere - 1:]
+    ra = [a[i] / a[i - 1] - 1 for i in range(1, len(a)) if a[i - 1]]
+    rb = [b[i] / b[i - 1] - 1 for i in range(1, len(b)) if b[i - 1]]
+    if len(ra) != len(rb) or len(ra) < 10:
+        return None
+    ma, mb = sum(ra) / len(ra), sum(rb) / len(rb)
+    kov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    va, vb = sum((x - ma) ** 2 for x in ra), sum((y - mb) ** 2 for y in rb)
+    return kov / (va * vb) ** 0.5 if va > 0 and vb > 0 else None
+
+
+def _trend_yonu(kapanislar: list, alt_tolerans: float = 0.0) -> str:
+    """EMA20/EMA50 ve kapanisa gore trend yonu: YUKARI / ASAGI / YATAY / BILINMIYOR."""
+    if len(kapanislar) < 55:
+        return "BILINMIYOR"
+    e20, e50, kapanis = ema_hesapla(kapanislar, 20), ema_hesapla(kapanislar, 50), kapanislar[-1]
+    if e20 > e50 and kapanis > e50:
+        return "YUKARI"
+    if e20 < e50 and kapanis < e50 * (1 - alt_tolerans):
+        return "ASAGI"
+    return "YATAY"
+
+
+# ==========================================================================
+# v19 BOLUM 2: BTC PIYASA REJIMI (detayli)
+# ==========================================================================
+# Altcoinler cogunlukla BTC'yi takip eder. BTC sadece 24 saatlik degisimle
+# degil; gunluk ve 4 saatlik trend, trend gucu/yonu, son 4 ve 24 saatteki
+# hareket ve oynaklikla degerlendirilir. USDT paritesi tercih edilir (TRY
+# paritesi lira kaybini da icerir), yoksa BTCTRY kullanilir.
+BTC_ANALIZ_SEMBOLLERI = ("BTCUSDT", "BTCTRY")
+BTC_RISK_4S_DUSUS_PCT = -3.0
+BTC_RISK_24S_DUSUS_PCT = -5.0
+BTC_RISK_ATR_PCT = 2.5
+BTC_REJIM_ONBELLEK_SANIYE = 300
+_btc_rejim_onbellek: dict = {"zaman": 0.0, "sonuc": None}
+
+
+def btc_rejim_analizi(zorla: bool = False) -> dict:
+    """BTC rejimi: GUCLU (tam kapasite) / NOTR / ZAYIF (yarim kapasite, BTC'ye
+    bagli coinlere girilmez) / RISKLI (yeni alim yok) / BILINMIYOR (veri yok)."""
+    simdi = time.time()
+    if (not zorla and _btc_rejim_onbellek["sonuc"] is not None
+            and simdi - _btc_rejim_onbellek["zaman"] < BTC_REJIM_ONBELLEK_SANIYE):
+        return _btc_rejim_onbellek["sonuc"]
+    sonuc = {"rejim": "BILINMIYOR", "sembol": None, "notlar": [], "kapanis_1h": []}
+    for sembol in BTC_ANALIZ_SEMBOLLERI:
+        try:
+            h1 = mumlari_getir(sembol, "1h")
+            h4 = mumlari_getir(sembol, "4h")
+            d1 = mumlari_getir(sembol, "1d")
+        except Exception as e:
+            sonuc["notlar"].append(f"{sembol} verisi alinamadi: {e}")
+            continue
+        if not h1 or not h4 or len(h1["kapanis"]) < 60 or len(h4["kapanis"]) < 60:
+            sonuc["notlar"].append(f"{sembol} icin yeterli mum yok")
+            continue
+        k1 = h1["kapanis"]
+        fiyat = h1["son_fiyat"]
+        degisim_4s = (fiyat / k1[-4] - 1) * 100
+        degisim_24s = (fiyat / k1[-24] - 1) * 100
+        atr1 = atr_hesapla(h1["yuksek"], h1["dusuk"], k1, 14)
+        atr_pct = atr1 / fiyat * 100 if atr1 and fiyat else 0.0
+        gunluk = _trend_yonu(d1["kapanis"], alt_tolerans=0.03) if d1 else "BILINMIYOR"
+        h4_trend = _trend_yonu(h4["kapanis"])
+        adx4, pdi4, mdi4 = adx_di_hesapla(h4["yuksek"], h4["dusuk"], h4["kapanis"], 14)
+        rsi1 = rsi_hesapla(k1[-60:], 14)
+
+        if (degisim_4s <= BTC_RISK_4S_DUSUS_PCT or degisim_24s <= BTC_RISK_24S_DUSUS_PCT
+                or (atr_pct >= BTC_RISK_ATR_PCT and degisim_4s < 0)):
+            rejim = "RISKLI"
+        elif h4_trend == "ASAGI" or gunluk == "ASAGI":
+            rejim = "ZAYIF"
+        elif gunluk == "YUKARI" and h4_trend == "YUKARI" and adx4 is not None and adx4 >= 20 and pdi4 > mdi4:
+            rejim = "GUCLU"
+        else:
+            rejim = "NOTR"
+        sonuc.update({
+            "rejim": rejim, "sembol": sembol, "fiyat": fiyat, "degisim_4s": degisim_4s,
+            "degisim_24s": degisim_24s, "atr_pct_1h": atr_pct, "gunluk_trend": gunluk,
+            "h4_trend": h4_trend, "adx_4h": adx4, "pdi_4h": pdi4, "mdi_4h": mdi4, "rsi_1h": rsi1,
+            "kapanis_1h": k1,
+        })
+        break
+    _btc_rejim_onbellek.update(zaman=simdi, sonuc=sonuc)
+    return sonuc
+
+
+def btc_raporu_satirlari(btc: dict) -> list:
+    if btc.get("rejim") == "BILINMIYOR" or btc.get("sembol") is None:
+        return [f"BTC rejimi: BILINMIYOR ({'; '.join(btc.get('notlar', [])) or 'veri yok'})"]
+    adx = btc.get("adx_4h")
+    yon = "yukari" if (btc.get("pdi_4h") or 0) > (btc.get("mdi_4h") or 0) else "asagi"
+    return [
+        f"BTC rejimi: {btc['rejim']} ({btc['sembol']})",
+        f"  Gunluk trend: {btc['gunluk_trend']} | 4 saatlik trend: {btc['h4_trend']} | "
+        f"4s ADX: {adx:.1f} ({yon})" if adx is not None else
+        f"  Gunluk trend: {btc['gunluk_trend']} | 4 saatlik trend: {btc['h4_trend']}",
+        f"  Son 4 saat: %{btc['degisim_4s']:+.2f} | Son 24 saat: %{btc['degisim_24s']:+.2f} | "
+        f"1s oynaklik (ATR): %{btc['atr_pct_1h']:.2f}"
+        + (f" | 1s RSI: {btc['rsi_1h']:.1f}" if btc.get("rsi_1h") is not None else ""),
+    ]
+
+
+# ==========================================================================
+# v19 BOLUM 3: COIN DETAYLI ANALIZI (zorunlu kurallar + 100 uzerinden puan)
+# ==========================================================================
+R_STOP_ATR_KATSAYI = 1.5     # stop: giris - 1.5 x ATR(1s) (veya destegin hemen alti)
+R_STOP_MIN_PCT = 0.02
+R_STOP_MAKS_PCT = 0.06
+MIN_ODA_R = 1.0              # en yakin anlamli dirence kadar en az 1R alan (hedef 1 dirence takilmasin)
+# v19 KAR ALMA / ZARAR KESME (R = giris ile ilk stop arasi mesafe = 1 birim risk)
+TP1_R, TP1_ORAN = 1.0, 1 / 3          # +1R'de pozisyonun 1/3'u satilir, stop basa-basa cekilir
+TP2_R, TP2_ORAN = 2.0, 0.5            # +2R'de KALANIN yarisi satilir, stop +1R'ye kilitlenir
+TP2_SONRASI_KILIT_R = 1.0
+CHANDELIER_ATR_KATSAYI = 2.5          # kalan kisim: zirve - 2.5 x ATR takip eden stop
+CHANDELIER_SIKI_ATR_KATSAYI = 1.5     # zirve +4R'yi gecince takip sikilasir
+CHANDELIER_SIKI_R = 4.0
+KOVALAMA_MAKS_R = 0.5                 # analizden sonra fiyat +0.5R'den fazla kactiysa alim ertelenir
+ANALIZ_MIN_SKOR = _ortam_sayisi_oku("AURELIUS_MIN_SKOR", 55.0)
+DERIN_ANALIZ_MAKS = 8        # her taramada detayli incelenen en fazla coin sayisi
+STABIL_COINLER = ("USDT", "USDC", "FDUSD", "BUSD", "TUSD", "DAI")
+
+
+def _usd_trendi(symbol: str) -> tuple:
+    """Coinin USDT paritesindeki 4 saatlik trend: (yon, usdt_sembolu). TRY
+    paritesindeki yukselis lira kaybindan da gelebilir; gercek hareket USDT'de
+    gorulur. Parite yoksa ('BILINMIYOR', None)."""
+    if not symbol.endswith("TRY"):
+        return "BILINMIYOR", None
+    taban = symbol[:-3]
+    usd = taban + "USDT"
+    if taban in STABIL_COINLER or usd in _usd_paritesi_yok:
+        return "BILINMIYOR", None
+    try:
+        veri = mumlari_getir(usd, "4h", 100)
+    except urllib.error.HTTPError:
+        _usd_paritesi_yok.add(usd)
+        return "BILINMIYOR", None
+    except Exception:
+        return "BILINMIYOR", None
+    if not veri:
+        return "BILINMIYOR", None
+    return _trend_yonu(veri["kapanis"]), usd
+
+
+def coin_derin_analiz(symbol: str, btc: Optional[dict] = None) -> dict:
+    """Coini gunluk/4s/1s/15dk mumlar, hacim, destek/direnc, USDT paritesi ve BTC
+    ile birlikte inceler. Donus: gecti (bool), skor (0-100), sebep (elendiyse),
+    stop/hedef fiyatlari ve tum gosterge degerleri. Veri eksikse GIRILMEZ."""
+    a = {"symbol": symbol, "gecti": False, "skor": 0.0, "sebep": "", "puanlar": {}}
+    try:
+        h1 = mumlari_getir(symbol, "1h")
+        h4 = mumlari_getir(symbol, "4h")
+        d1 = mumlari_getir(symbol, "1d")
+        m15 = mumlari_getir(symbol, "15m", 100)
+    except Exception as e:
+        a["sebep"] = f"mum verisi alinamadi ({e})"
+        return a
+    if not h1 or not h4 or len(h1["kapanis"]) < 60 or len(h4["kapanis"]) < 60:
+        a["sebep"] = "yeterli mum verisi yok (yeni listelenmis olabilir)"
+        return a
+    btc = btc or {"rejim": "BILINMIYOR"}
+
+    fiyat = h1["son_fiyat"]
+    k1, k4 = h1["kapanis"], h4["kapanis"]
+    ema20_1, ema50_1 = ema_hesapla(k1, 20), ema_hesapla(k1, 50)
+    rsi1, rsi4 = rsi_hesapla(k1[-80:], 14), rsi_hesapla(k4[-80:], 14)
+    adx1, pdi1, mdi1 = adx_di_hesapla(h1["yuksek"], h1["dusuk"], k1, 14)
+    atr1 = atr_hesapla(h1["yuksek"], h1["dusuk"], k1, 14)
+    macd = macd_histogram(k1)
+    ema50_4_egim = egim_pct(ema_serisi(k4, 50), 5)
+    adx4, pdi4, mdi4 = adx_di_hesapla(h4["yuksek"], h4["dusuk"], k4, 14)
+    gunluk = _trend_yonu(d1["kapanis"], alt_tolerans=0.03) if d1 else "BILINMIYOR"
+    h4_trend = _trend_yonu(k4)
+    gor_hacim = goreceli_hacim(h1["hacim"], 20)
+    obv = obv_egimi(k1, h1["hacim"], 20)
+    alici = alici_orani(h1["hacim"], h1["alici_hacim"], 6)
+    rsi15 = rsi_hesapla(m15["kapanis"][-60:], 14) if m15 and len(m15["kapanis"]) >= 30 else None
+    ema20_15 = ema_hesapla(m15["kapanis"], 20) if m15 and len(m15["kapanis"]) >= 30 else None
+    atr15 = (atr_hesapla(m15["yuksek"], m15["dusuk"], m15["kapanis"], 14)
+             if m15 and len(m15["kapanis"]) >= 30 else None)
+    usd_trend, usd_sembol = _usd_trendi(symbol)
+    korelasyon = getiri_korelasyonu(k1, btc.get("kapanis_1h") or [], 72)
+
+    # Stop: once destegin hemen alti (%2-6 araliginda ise), yoksa 1.5 x ATR
+    # Direnc/destek: 4s salinimlari (~20 gun) + 1s'te genis pencereli son 3 gunun salinimlari
+    # (kucuk 1s dalgalanmalari direnc sayilmaz).
+    tepeler1, dipler1 = salinim_seviyeleri(h1["yuksek"], h1["dusuk"], 5, 72)
+    tepeler4, dipler4 = salinim_seviyeleri(h4["yuksek"], h4["dusuk"], 3, 120)
+    atr_stop_pct = min(max(R_STOP_ATR_KATSAYI * (atr1 or 0) / fiyat, R_STOP_MIN_PCT), R_STOP_MAKS_PCT)
+    stop_fiyati, stop_kaynagi, destek = fiyat * (1 - atr_stop_pct), "ATR", None
+    for d in sorted((d for d in dipler1 + dipler4 if d < fiyat), reverse=True):
+        aday = d - 0.25 * (atr1 or 0)
+        oran = (fiyat - aday) / fiyat
+        if R_STOP_MIN_PCT <= oran <= R_STOP_MAKS_PCT:
+            stop_fiyati, stop_kaynagi, destek = aday, "DESTEK", d
+            break
+    risk = fiyat - stop_fiyati
+    direncler = [t for t in tepeler1 + tepeler4 if t > fiyat * 1.003]
+    direnc = min(direncler) if direncler else None
+    oda_r = (direnc - fiyat) / risk if (direnc and risk > 0) else None
+
+    a.update({
+        "fiyat": fiyat, "stop_fiyati": stop_fiyati, "stop_pct": risk / fiyat, "stop_kaynagi": stop_kaynagi,
+        "destek": destek, "direnc": direnc, "oda_r": oda_r, "atr_1h": atr1,
+        "hedef1": fiyat + TP1_R * risk, "hedef2": fiyat + TP2_R * risk,
+        "gunluk_trend": gunluk, "h4_trend": h4_trend, "ema50_4h_egim": ema50_4_egim,
+        "rsi_1h": rsi1, "rsi_4h": rsi4, "rsi_15m": rsi15, "adx_1h": adx1, "pdi_1h": pdi1, "mdi_1h": mdi1,
+        "adx_4h": adx4, "pdi_4h": pdi4, "mdi_4h": mdi4,
+        "macd_hist": macd, "goreceli_hacim": gor_hacim, "obv_egimi": obv, "alici_orani": alici,
+        "usd_trend": usd_trend, "usd_sembol": usd_sembol, "btc_korelasyon": korelasyon,
+        "btc_rejim": btc.get("rejim", "BILINMIYOR"),
+        # eski kartla uyum (giris karti / Telegram)
+        "ema50": ema50_1, "rsi14": rsi1, "adx14": adx1,
+    })
+
+    # ---- ZORUNLU KURALLAR (biri bile saglanmazsa girilmez) ----
+    kurallar = [
+        (gunluk == "ASAGI", "gunluk grafikte dusus trendi"),
+        (h4_trend != "YUKARI", f"4 saatlik trend yukari degil ({h4_trend})"),
+        (adx4 is None or adx4 < ADX_MIN_ESIK, f"4 saatlik trend zayif (ADX {adx4 or 0:.1f} < {ADX_MIN_ESIK})"),
+        (pdi4 is not None and mdi4 is not None and pdi4 <= mdi4, "4 saatlik trend yonu asagi (+DI <= -DI)"),
+        (adx1 is None or adx1 < ADX_MIN_ESIK, f"1 saatlik trend zayif (ADX {adx1 or 0:.1f} < {ADX_MIN_ESIK})"),
+        (not ((macd and macd[0] > macd[1]) or k1[-1] > ema20_1),
+         "1 saatlikte geri cekilme suruyor (MACD zayifliyor ve fiyat EMA20 altinda)"),
+        (rsi1 is None or not (RSI_KALITE_ALT_ESIK <= rsi1 <= RSI_KALITE_UST_ESIK),
+         f"1s RSI uygun aralikta degil ({rsi1 or 0:.1f}, olmasi gereken {RSI_KALITE_ALT_ESIK}-{RSI_KALITE_UST_ESIK})"),
+        (rsi4 is not None and rsi4 > 72, f"4 saatlikte asiri alim (RSI {rsi4 or 0:.1f})"),
+        (rsi15 is not None and rsi15 > 75, f"son 15 dakikada asiri yukselmis (RSI {rsi15 or 0:.1f})"),
+        (ema20_15 is not None and atr15 and fiyat > ema20_15 + 2.5 * atr15, "son 15 dakikada kopmus yukselis - kovalanmaz"),
+        (oda_r is not None and oda_r < MIN_ODA_R, f"dirence cok yakin (kar alani {oda_r or 0:.1f}R < {MIN_ODA_R}R)"),
+        (usd_trend == "ASAGI", f"{usd_sembol} paritesinde dusus - TRY yukselisi lira kaynakli olabilir"),
+        (btc.get("rejim") == "RISKLI", "BTC riskli (sert dusus/oynaklik)"),
+        (btc.get("rejim") == "ZAYIF" and korelasyon is not None and korelasyon >= 0.6,
+         f"BTC zayif ve coin BTC'ye bagli (korelasyon {korelasyon or 0:.2f})"),
+    ]
+    for kosul, sebep in kurallar:
+        if kosul:
+            a["sebep"] = sebep
+            return a
+
+    # ---- PUAN (0-100) ----
+    p = a["puanlar"]
+    p["trend"] = ((10 if gunluk == "YUKARI" else 5 if gunluk == "BILINMIYOR" else 0)
+                  + (5 if (ema50_4_egim or 0) > 0 else 0)
+                  + min(10.0, max(0.0, (adx4 - 20) * 0.5))
+                  + (5 if (pdi1 or 0) > (mdi1 or 0) else 0))
+    p["ivme"] = ((5 if macd and macd[0] > 0 else 0) + (5 if macd and macd[0] > macd[1] else 0)
+                 + (5 if 45 <= rsi1 <= 60 else 0) + (5 if k1[-1] > ema20_1 else 0))
+    p["hacim"] = ((8 if (gor_hacim or 0) >= 1.2 else 4 if (gor_hacim or 0) >= 0.8 else 0)
+                  + (6 if (obv or 0) > 0 else 0)
+                  + (6 if (alici or 0) >= 0.52 else 3 if (alici or 0) >= 0.48 else 0))
+    p["kar_alani"] = (15 if (oda_r is None or oda_r >= 3) else 10 if oda_r >= 2
+                      else 7 if oda_r >= 1.5 else 4)
+    p["btc"] = {"GUCLU": 10, "NOTR": 6, "BILINMIYOR": 5, "ZAYIF": 3}.get(btc.get("rejim"), 5)
+    p["lira"] = 5 if usd_trend == "YUKARI" else 3
+    a["skor"] = round(sum(p.values()), 1)
+    if a["skor"] < ANALIZ_MIN_SKOR:
+        a["sebep"] = f"puan yetersiz ({a['skor']:.0f} < {ANALIZ_MIN_SKOR:.0f})"
+        return a
+    a["gecti"] = True
+    return a
+
+
+def analiz_raporu_satirlari(a: dict) -> list:
+    """Detayli analizin okunur ozeti (konsol, 'analiz' komutu ve Telegram /analiz)."""
+    satirlar = [f"{a['symbol']}: " + (f"GIRILEBILIR - puan {a['skor']:.0f}/100" if a.get("gecti")
+                                      else f"GIRILMEZ - {a.get('sebep') or 'bilinmiyor'}")]
+    if "fiyat" not in a:
+        return satirlar
+    def s(x, fmt="{:.1f}"):
+        return "-" if x is None else fmt.format(x)
+    yon = "yukari" if (a.get("pdi_1h") or 0) > (a.get("mdi_1h") or 0) else "asagi"
+    macd = a.get("macd_hist")
+    satirlar += [
+        f"  Fiyat: {format_fiyat(a['fiyat'])} TRY",
+        f"  Trend  -> gunluk: {a['gunluk_trend']} | 4s: {a['h4_trend']} (ADX {s(a.get('adx_4h'))}) | "
+        f"1s ADX: {s(a.get('adx_1h'))} ({yon})"
+        + (f" | USDT paritesi: {a['usd_trend']}" if a.get("usd_sembol") else ""),
+        f"  Ivme   -> RSI 1s/4s/15dk: {s(a.get('rsi_1h'))}/{s(a.get('rsi_4h'))}/{s(a.get('rsi_15m'))} | "
+        f"MACD: {'pozitif' if macd and macd[0] > 0 else 'negatif'}{', guclenen' if macd and macd[0] > macd[1] else ''}",
+        f"  Hacim  -> son saat ortalamanin {s(a.get('goreceli_hacim'), '{:.1f}')} kati | "
+        f"OBV: {'alim baskisi' if (a.get('obv_egimi') or 0) > 0 else 'satis baskisi'} | "
+        f"alici payi: %{s((a.get('alici_orani') or 0) * 100, '{:.0f}')}",
+        f"  Seviye -> destek: {format_fiyat(a['destek']) if a.get('destek') else '-'} | direnc: "
+        f"{format_fiyat(a['direnc']) if a.get('direnc') else 'yok (zirve bolgesi)'}"
+        + (f" ({a['oda_r']:.1f}R uzakta)" if a.get("oda_r") is not None else ""),
+        f"  Plan   -> stop {format_fiyat(a['stop_fiyati'])} (-%{a['stop_pct'] * 100:.1f}, {a['stop_kaynagi']}) | "
+        f"hedef1 {format_fiyat(a['hedef1'])} | hedef2 {format_fiyat(a['hedef2'])}",
+        f"  BTC    -> rejim {a['btc_rejim']}"
+        + (f" | korelasyon {a['btc_korelasyon']:.2f}" if a.get("btc_korelasyon") is not None else ""),
+    ]
+    if a.get("puanlar"):
+        satirlar.append("  Puan   -> " + ", ".join(f"{k}: {v:.0f}" for k, v in a["puanlar"].items()))
+    return satirlar
 
 
 def coin_degerlendir_ve_sec(semboller: list, sayisi: int):
@@ -3356,12 +3955,43 @@ def coin_degerlendir_ve_sec(semboller: list, sayisi: int):
     # guclu aday oncelikli denenir.
     nihai_adaylar.sort(key=lambda x: adx_map.get(x[0], 0.0), reverse=True)
 
+    # v19: DETAYLI ANALIZ - BTC rejimi + her hazir aday icin gunluk/4s/1s/15dk,
+    # hacim, destek/direnc, USDT paritesi. Sadece buradan GECEN coinlere girilir.
+    btc = btc_rejim_analizi()
+    print(f"{CYAN}  DETAYLI ANALIZ (gunluk / 4s / 1s / 15dk, hacim, destek-direnc, BTC){RESET}")
+    for satir in btc_raporu_satirlari(btc):
+        print(f"  {satir}")
+    print(f"{CYAN}{'-' * 74}{RESET}")
+    analiz_sayisi = 0
+    for sym, _, _ in nihai_adaylar:
+        if durum_map[sym] == "HAZIR" and analiz_sayisi < DERIN_ANALIZ_MAKS:
+            analiz_sayisi += 1
+            analiz = coin_derin_analiz(sym, btc)
+            time.sleep(API_CALL_SLEEP_SECONDS)
+        elif durum_map[sym] == "HAZIR":
+            analiz = {"symbol": sym, "gecti": False, "skor": 0.0, "sebep": "bu turda detayli analiz sirasi gelmedi"}
+        else:
+            analiz = {"symbol": sym, "gecti": False, "skor": 0.0, "sebep": "RSI yuksek, sogumasi bekleniyor"}
+        bilgi_map[sym]["derin"] = analiz
+        if analiz.get("gecti"):
+            print(f"  {sym:<10} {GREEN}GIRILEBILIR{RESET} puan {analiz['skor']:.0f}/100 | stop -%"
+                  f"{analiz['stop_pct'] * 100:.1f} | hedef1 +%{analiz['stop_pct'] * 100 * TP1_R:.1f} | "
+                  f"hedef2 +%{analiz['stop_pct'] * 100 * TP2_R:.1f}")
+        elif "fiyat" in analiz:
+            print(f"  {sym:<10} {YELLOW}girilmez{RESET}   {analiz['sebep']}")
+    nihai_adaylar.sort(key=lambda x: (bilgi_map[x[0]]["derin"].get("gecti", False),
+                                      bilgi_map[x[0]]["derin"].get("skor", 0.0),
+                                      adx_map.get(x[0], 0.0)), reverse=True)
+
     secilenler = nihai_adaylar[:sayisi]
 
     print(f"{CYAN}{'-' * 74}{RESET}")
     print(f"{BOLD}{GREEN}  IZLEME LISTESI ({len(secilenler)} coin - esnek, zorunlu sabit sayi yok):{RESET}")
     for sym, hacim_try, degisim_pct in secilenler:
-        durum_etiketi = "beklemede (RSI sogusun)" if durum_map[sym] == "BEKLEMEDE" else "hazir"
+        derin = bilgi_map[sym].get("derin", {})
+        durum_etiketi = ("beklemede (RSI sogusun)" if durum_map[sym] == "BEKLEMEDE"
+                         else f"GIRILEBILIR (puan {derin.get('skor', 0):.0f})" if derin.get("gecti")
+                         else "izleniyor (analizden gecmedi)")
         print(f"    -> {sym}  (hacim: {hacim_try:,.0f} TRY, 24s degisim: %{degisim_pct:.2f}, durum: {durum_etiketi})")
     print(f"{CYAN}{'-' * 74}{RESET}\n")
 
@@ -3374,7 +4004,7 @@ def coin_degerlendir_ve_sec(semboller: list, sayisi: int):
 
 def print_banner():
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - v18'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - v19'.center(74)}{RESET}")
     print(f"{BOLD}{CYAN}  BINANCE TR AKILLI SECIM GRID BOT  |  PIYASA ADAPTIF MOTOR{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
     if CANLI_MOD:
@@ -3402,11 +4032,12 @@ def print_banner():
     print(f"{GRAY}  Trend filtresi     : EMA{EMA_PERIYOT}, esik %{TREND_ESIK_PCT * 100:.1f}{RESET}")
     print(f"{GRAY}  RSI giris filtresi : asiri alim>={RSI_ASIRI_ALIM_ESIGI} beklemeye alinir, "
           f"giris icin RSI {RSI_KALITE_ALT_ESIK}-{RSI_KALITE_UST_ESIK}{RESET}")
-    print(f"{GRAY}  Sabit stop-loss    : %{STOP_LOSS_PCT * 100:.0f} (taban){RESET}")
-    print(f"{GRAY}  Basa-bas aktivasyon: %{BREAKEVEN_AKTIVASYON_PCT * 100:.1f} kardan sonra stop=basabas{RESET}")
-    print(f"{GRAY}  Trailing aktivasyon: %{TRAILING_AKTIVASYON_PCT * 100:.1f} kardan sonra devreye girer{RESET}")
-    print(f"{GRAY}  Trailing mesafesi  : tepeden %{TRAILING_STOP_PCT * 100:.1f} geri cekilme{RESET}")
-    print(f"{GRAY}  Kismi kar alma     : %{KISMI_KAR_AL_PCT * 100:.0f} karda pozisyonun %{KISMI_KAR_AL_ORANI * 100:.0f}'i realize edilir{RESET}")
+    print(f"{GRAY}  Detayli analiz     : gunluk/4s/1s/15dk trend, hacim, destek-direnc, USDT paritesi, "
+          f"BTC rejimi (min puan {ANALIZ_MIN_SKOR:.0f}){RESET}")
+    print(f"{GRAY}  Stop (1R)          : destegin alti veya {R_STOP_ATR_KATSAYI:g} x ATR(1s), "
+          f"%{R_STOP_MIN_PCT * 100:.0f}-%{R_STOP_MAKS_PCT * 100:.0f} arasi{RESET}")
+    print(f"{GRAY}  Kar alma           : 1/3 +{TP1_R:g}R (stop basa-basa), kalanin yarisi +{TP2_R:g}R "
+          f"(stop +{TP2_SONRASI_KILIT_R:g}R), son kisim zirve-{CHANDELIER_ATR_KATSAYI:g}xATR takip{RESET}")
     print(f"{GRAY}  ADX trend filtresi : min {ADX_MIN_ESIK} (altinda whipsaw/yatay piyasa - GIRILMEZ){RESET}")
     print(f"{GRAY}  ATR grid adaptasyonu: dusuk vol ~%2.75 / orta ~%4 / yuksek vol ~%5.25 basamak{RESET}")
     print(f"{GRAY}  Zaman asimi cikisi : {MAKS_POZISYON_OMRU_SAAT:.0f}s+ ve kar<%{ZAMAN_ASIMI_KAR_ESIGI_PCT*100:.0f} ise zorla kapatilir{RESET}")
@@ -3450,7 +4081,8 @@ def giris_karti_olustur(symbol: str, coin_name: str, ema50, rsi14, adx14,
                          adet: float, exec_price: float, yatirilan_tl: float,
                          hedef_fiyat: float, stop_fiyat: float,
                          beklenen_net_kar: float, beklenen_net_kayip: float,
-                         calisma_modu: str) -> str:
+                         calisma_modu: str, hedef1_fiyat: Optional[float] = None,
+                         analiz_ozeti: Optional[str] = None) -> str:
     """
     v17 MODUL 3: Her ALIM icin ZENGIN, monospace bir ASCII kart uretir
     (konsol ve Telegram <pre> blogunda AYNI metin kullanilir). Sembol/Giris
@@ -3481,14 +4113,23 @@ def giris_karti_olustur(symbol: str, coin_name: str, ema50, rsi14, adx14,
         satir(f"Yatirilan     : {yatirilan_tl:,.2f} TRY"),
         satir(f"Alinan Miktar : {adet:,.2f} {coin_name}"),
         ic_cizgi(),
+    ] + ([
+        satir(f"Hedef 1 (1/3) : {format_fiyat(hedef1_fiyat)} TRY "
+              f"({(hedef1_fiyat - exec_price) / exec_price * 100 if exec_price else 0:+.1f}%)"),
+        satir(f"Hedef 2 (1/3) : {format_fiyat(hedef_fiyat)} TRY ({hedef_pct:+.1f}%)"),
+        satir("Kalan (1/3)   : takip eden stop ile (ust sinir yok)"),
+        satir(f"Beklenen Kar  : {beklenen_net_kar:+,.2f} TRY (temkinli)"),
+    ] if hedef1_fiyat is not None else [
         satir(f"Hedef Satis   : {format_fiyat(hedef_fiyat)} TRY ({hedef_pct:+.1f}%)"),
         satir(f"Hedef Kar     : {beklenen_net_kar:+,.2f} TRY"),
+    ]) + [
         satir(f"Stop-Loss     : {format_fiyat(stop_fiyat)} TRY ({stop_pct:+.1f}%)"),
         satir(f"Maks Risk     : {beklenen_net_kayip:+,.2f} TRY"),
         ic_cizgi(),
         satir(f"Gostergeler   : RSI:{rsi_str} | EMA:{ema_str}"),
         satir(f"Trend Gucu    : ADX:{adx_str} ({_adx_trend_etiketi(adx14)})"),
         satir(f"Mod           : {calisma_modu}"),
+    ] + ([satir(f"Analiz        : {analiz_ozeti}")] if analiz_ozeti else []) + [
         f"└{'─' * (W - 2)}┘",
     ]
     return "\n".join(satirlar)
@@ -3799,6 +4440,8 @@ TELEGRAM_YARDIM_METNI = (
     "/devam - yeni alimlari yeniden ac\n"
     "/bosalt - yeni alim yapma; acik pozisyonlar kapaninca botu durdur\n"
     "/hepsinisat - tum pozisyonlari piyasa fiyatindan sat (onay ister)\n"
+    "/analiz SEMBOL - coinin detayli analizi (orn. /analiz PEPETRY)\n"
+    "/btc - BTC piyasa rejimi\n"
     "/yardim - bu liste"
 )
 
@@ -3857,6 +4500,20 @@ def telegram_komutunu_uygula(komut: str, kasa: "MerkeziKasa", pozisyonlar: dict,
                              acik_pozisyon_sayaci: Optional[list], kontrol: dict) -> None:
     """Ana thread'de calisir (alim-satim ile ayni thread - yaris durumu olmaz)."""
     global _alim_durumu
+    parcalar = komut.split()
+    komut, arguman = parcalar[0], (parcalar[1] if len(parcalar) > 1 else "")
+    if komut == "/analiz":
+        sembol = arguman.upper()
+        if not (sembol.isalnum() and sembol.endswith("TRY") and len(sembol) > 3):
+            send_telegram("Kullanim: /analiz SEMBOL (orn. /analiz PEPETRY)")
+            return
+        btc = btc_rejim_analizi()
+        analiz = coin_derin_analiz(sembol, btc)
+        send_telegram("<pre>" + html.escape("\n".join(analiz_raporu_satirlari(analiz))) + "</pre>")
+        return
+    if komut == "/btc":
+        send_telegram("<pre>" + html.escape("\n".join(btc_raporu_satirlari(btc_rejim_analizi()))) + "</pre>")
+        return
     if komut == "/durum":
         send_telegram(durum_ozeti_metni(kasa, pozisyonlar))
     elif komut == "/alimdurdur":
@@ -3943,7 +4600,11 @@ def _telegram_komut_dinleyici() -> None:
                     continue
                 metin = (mesaj.get("text") or "").strip()
                 if metin.startswith("/"):
-                    _telegram_komut_kuyrugu.put(metin.split()[0].split("@")[0].lower())
+                    parcalar = metin.split()
+                    komut = parcalar[0].split("@")[0].lower()
+                    if komut == "/analiz" and len(parcalar) > 1:
+                        komut += " " + parcalar[1].upper()
+                    _telegram_komut_kuyrugu.put(komut)
         except Exception as e:
             logger.warning("Telegram komutlari alinamadi: %s", e)
             time.sleep(10)
@@ -4028,7 +4689,7 @@ def _bat_degeri(deger: str) -> str:
 
 
 def baslatici_olustur() -> int:
-    """'python project_aurelius_bot_v18.py kurulum': bu penceredeki ayarlarla, bot
+    """'python project_aurelius_bot_v19.py kurulum': bu penceredeki ayarlarla, bot
     cokerse/koparsa 60 sn sonra kendini yeniden baslatan baslatici dosyayi olusturur
     ve (Windows'ta, istege bagli) oturum acilinca otomatik baslatir."""
     gerekli = ["BINANCE_TR_API_KEY", "BINANCE_TR_SECRET_KEY", "AURELIUS_LIVE_CONFIRM", "AURELIUS_CANLI_MOD"]
@@ -4235,6 +4896,8 @@ def run_simulation():
     _saglik_pingi_gonder()
 
     real_poll_count = 0
+    son_btc_rejimi = None  # v19
+    btc_rejimi = "BILINMIYOR"
     izin_verilen_pozisyon = 0  # v14: guvenli varsayilan (ilk tick'ten once bir kesinti olursa)
     sniper_modu_aktif = False  # v17: guvenli varsayilan
     scan_araligi_tur = max(1, round((SCAN_INTERVAL_MINUTES * 60) / REAL_POLL_INTERVAL_SECONDS))
@@ -4254,6 +4917,21 @@ def run_simulation():
                           f"YENI pozisyon aranmiyor (mevcut pozisyonlar yonetilmeye devam ediyor).{RESET}")
             except Exception:
                 pass
+            # v19: detayli BTC rejimi (5 dk onbellekli). RISKLI -> yeni alim yok.
+            try:
+                btc_rejimi = btc_rejim_analizi().get("rejim", "BILINMIYOR")
+            except Exception:
+                btc_rejimi = "BILINMIYOR"
+            if btc_rejimi != son_btc_rejimi:
+                if son_btc_rejimi is not None:
+                    print(f"[{ts()}] {CYAN}BTC rejimi degisti: {son_btc_rejimi} -> {btc_rejimi}{RESET}")
+                    if btc_rejimi == "RISKLI" or son_btc_rejimi == "RISKLI":
+                        send_telegram(f"\u26A0\uFE0F <b>BTC rejimi: {son_btc_rejimi} -> {btc_rejimi}</b>\n"
+                                      + ("Yeni alim yapilmayacak; acik pozisyonlar yonetilmeye devam ediyor."
+                                         if btc_rejimi == "RISKLI" else "Yeni alimlar tekrar degerlendiriliyor."))
+                son_btc_rejimi = btc_rejimi
+            if btc_rejimi == "RISKLI":
+                piyasa_sert_duste = True
 
             # Sayac tick icinde canli guncellenir, ama basarisiz tasfiye / mutabakat
             # ile kapatilan pozisyonlar gibi yollarla kayabilir; her tick gercekten
@@ -4263,8 +4941,8 @@ def run_simulation():
             acik_pozisyon_sayaci[0] = sum(1 for b in pozisyonlar.values() if b.has_open_position)
             guncel_bakiye = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
             izin_verilen_pozisyon, hedef_pozisyon_tutari, sniper_modu_aktif = dinamik_pozisyon_planla(
-                kasa.bakiye, guncel_bakiye, btc_degisim
-            )  # v17: kasaya gore adaptif Sniper Modu / kademeli portfoy modeli
+                kasa.bakiye, guncel_bakiye, btc_degisim, btc_rejimi
+            )  # v17: kasaya gore adaptif Sniper Modu / kademeli portfoy modeli; v19: BTC rejimi
             if _alim_durumu != "ACIK":
                 izin_verilen_pozisyon = 0  # v18: /alimdurdur veya /bosalt - sadece yonetim, yeni alim yok
             en_kaliteli_aday = en_kaliteli_aday_belirle(bilgi_map, pozisyonlar)  # v17 MODUL 1.2
@@ -4424,7 +5102,7 @@ def run_simulation():
                     time.sleep(SUB_TICK_SECONDS)
                     guncel_bakiye_sim = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
                     izin_verilen_sim, hedef_sim, sniper_sim = dinamik_pozisyon_planla(
-                        kasa.bakiye, guncel_bakiye_sim, btc_degisim
+                        kasa.bakiye, guncel_bakiye_sim, btc_degisim, btc_rejimi
                     )
                     if _alim_durumu != "ACIK":
                         izin_verilen_sim = 0
@@ -4492,7 +5170,7 @@ def backtest_calistir(symbol: str, gun: int, sermaye: float = None):
     sermaye = sermaye if sermaye is not None else TOPLAM_SANAL_BAKIYE_TRY
 
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - BACKTEST MODU (v18)'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - BACKTEST MODU (v19)'.center(74)}{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
     print(f"  Sembol: {symbol}   |   Test edilen sure: son {gun} gun (1 saatlik mumlarla)   |   Sermaye: {sermaye:,.2f} TRY\n")
     print(f"{YELLOW}  NOT: Backtest, ORIJINAL coklu-seviye grid davranisini kullanir "
@@ -4561,6 +5239,22 @@ def backtest_calistir(symbol: str, gun: int, sermaye: float = None):
     print(f"{YELLOW}  Not: Bu bir GECMIS VERIYLE simulasyondur, gelecekteki performansi garanti etmez.{RESET}")
 
 
+def analiz_komutu(sembol: Optional[str]) -> int:
+    """'python project_aurelius_bot_v19.py analiz [SEMBOL]': botun bir coini nasil
+    degerlendirdigini gosterir (emir gondermez, anahtar gerektirmez)."""
+    print(f"{BOLD}DETAYLI ANALIZ{RESET}")
+    btc = btc_rejim_analizi(zorla=True)
+    for satir in btc_raporu_satirlari(btc):
+        print(f"  {satir}")
+    if sembol:
+        print()
+        for satir in analiz_raporu_satirlari(coin_derin_analiz(sembol, btc)):
+            print(f"  {satir}")
+    else:
+        print(f"\n  Bir coini incelemek icin: python {os.path.basename(__file__)} analiz PEPETRY")
+    return CIKIS_DUR
+
+
 def main():
     komut = sys.argv[1].lower() if len(sys.argv) > 1 else ""
     try:
@@ -4573,6 +5267,8 @@ def main():
         elif komut == "baglanti":
             baglanti_testi()
             kod = CIKIS_DUR
+        elif komut == "analiz":
+            kod = analiz_komutu(sys.argv[2].upper() if len(sys.argv) > 2 else None)
         elif komut == "kurulum":
             kod = baslatici_olustur()
         else:
