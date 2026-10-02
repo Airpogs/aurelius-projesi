@@ -21,6 +21,8 @@ v20 - RISK KORUMASI, ISLEM GUNLUGU VE GECMIS VERI TESTI:
   5) Gecmis veri testi: 'backtest [GUN] [SERMAYE] [SEMBOLLER]' v20 kurallarini
      (detayli analiz, R cikislari, risk korumasi, komisyon/kayma) gecmis
      mumlarda calistirir ve rapor verir. Emir gondermez, anahtar gerektirmez.
+     'backtest 60 1000 60' gecmisteki bir donemi (60 gun once biten 60 gun) test eder.
+     'karsilastir [GUN]' puan barajlarini (55-75) iki ardisik donemde yan yana karsilastirir.
 v19 - DETAYLI ANALIZ VE R TABANLI KAR ALMA:
   GIRIS: Bot bir coine girmeden once onu gunluk, 4 saatlik, 1 saatlik ve 15
   dakikalik mumlarla (her birinde ~200 kapanmis mum) inceler:
@@ -505,6 +507,7 @@ Kullanim:
     python project_aurelius_bot_v20.py backtest [GUN] [SERMAYE] [SEMBOLLER]  (gecmis veri testi, emir gondermez)
     python project_aurelius_bot_v20.py analiz [SEMBOL]          (detayli analiz raporu, emir gondermez)
     python project_aurelius_bot_v20.py rapor                    (islem gunlugu ozeti)
+    python project_aurelius_bot_v20.py karsilastir [GUN]        (puan barajlarini iki donemde karsilastirir)
 """
 
 import time
@@ -5719,6 +5722,8 @@ BACKTEST_GUN_ARALIGI = (7, 120)
 BACKTEST_VARSAYILAN_SERMAYE = 1000.0
 BACKTEST_COIN_SAYISI = 15
 BACKTEST_SLIPAJ_PCT = (SLIPAJ_MIN_PCT + SLIPAJ_MAKS_PCT) / 2
+BACKTEST_MAKS_GERI_GUN = 240
+KARSILASTIRMA_BARAJLARI = (55, 60, 65, 70, 75)
 _MUM_ALANLARI = ("acilis", "yuksek", "dusuk", "kapanis", "hacim", "alici_hacim")
 
 
@@ -5766,7 +5771,8 @@ class _GecmisSeri:
 
 
 def backtest_simule_et(coin_verileri: dict, btc_verisi: Optional[dict], bas_ms: int, bitis_ms: int,
-                       sermaye: float) -> dict:
+                       sermaye: float, min_skor: Optional[float] = None,
+                       onbellek: Optional[dict] = None) -> dict:
     """coin_verileri: {sembol: {"15m","1h","4h","1d","usd4h": gecmis_mumlari_getir ciktisi (veya None),
     "usd_sembol": str|None}}; btc_verisi: {"sembol", "1h", "4h", "1d"}. Islemler 15 dakikalik mumlarla
     yonetilir, yeni giris kararlari her saat basi (canli bot gibi tek seferde en yuksek puanli coin)."""
@@ -5841,6 +5847,14 @@ def backtest_simule_et(coin_verileri: dict, btc_verisi: Optional[dict], bas_ms: 
             sat(sembol, 0, kap, "ZAMAN-ASIMI", t_kapanis, True)
 
     def btc_durumu(t: int) -> dict:
+        if onbellek is not None and ("BTC", t) in onbellek:
+            return onbellek[("BTC", t)]
+        sonuc_btc = _btc_durumu_hesapla(t)
+        if onbellek is not None:
+            onbellek[("BTC", t)] = sonuc_btc
+        return sonuc_btc
+
+    def _btc_durumu_hesapla(t: int) -> dict:
         if not btc_seri.get("1h") or not btc_seri.get("4h"):
             return {"rejim": "BILINMIYOR"}
         h1 = btc_seri["1h"].pencere(t, MUM_SAYISI, 0.0)
@@ -5852,6 +5866,15 @@ def backtest_simule_et(coin_verileri: dict, btc_verisi: Optional[dict], bas_ms: 
         return btc_rejim_hesapla(btc_verisi.get("sembol", "BTC"), h1, h4, d1) or {"rejim": "BILINMIYOR"}
 
     def analiz(sembol: str, t: int, btc: dict) -> dict:
+        # Analiz sadece t anina kadarki veriye bagli; karsilastirmada farkli baraj denemeleri paylasir.
+        if onbellek is not None and (sembol, t) in onbellek:
+            return onbellek[(sembol, t)]
+        a = _analiz_hesapla(sembol, t, btc)
+        if onbellek is not None:
+            onbellek[(sembol, t)] = a
+        return a
+
+    def _analiz_hesapla(sembol: str, t: int, btc: dict) -> dict:
         fiyat = son_fiyat[sembol]
         s = seri[sembol]
         if "1h" not in s or "4h" not in s:
@@ -5911,7 +5934,7 @@ def backtest_simule_et(coin_verileri: dict, btc_verisi: Optional[dict], bas_ms: 
             if kapanis and t - kapanis[0] < _cooldown_suresi_hesapla(kapanis[1]) * 60_000:
                 continue
             a = analiz(sembol, t, btc)
-            if a.get("gecti"):
+            if a.get("gecti") and (min_skor is None or a.get("skor", 0.0) >= min_skor):
                 adaylar.append(a)
         if not adaylar:
             continue
@@ -5991,33 +6014,43 @@ def _backtest_verisini_indir(semboller: list, bas_ms: int, bitis_ms: int) -> tup
     return coin_verileri, btc_verisi
 
 
-def _donem_degisimi(veri: Optional[dict], bas_ms: int) -> Optional[float]:
+def _donem_degisimi(veri: Optional[dict], bas_ms: int, bitis_ms: Optional[int] = None) -> Optional[float]:
     """Test donemi basindan sonuna kapanis fiyati degisimi (%)."""
     if not veri or not veri.get("zaman"):
         return None
     i = bisect.bisect_left(veri["zaman"], bas_ms)
-    if i >= len(veri["zaman"]) or not veri["kapanis"][i]:
+    j = len(veri["zaman"]) - 1 if bitis_ms is None else bisect.bisect_left(veri["zaman"], bitis_ms) - 1
+    if i >= len(veri["zaman"]) or j <= i or not veri["kapanis"][i]:
         return None
-    return (veri["kapanis"][-1] / veri["kapanis"][i] - 1) * 100
+    return (veri["kapanis"][j] / veri["kapanis"][i] - 1) * 100
+
+
+def _tarih(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000).strftime("%d.%m.%Y")
+
+
+def _piyasa_kiyasi(coin_verileri: dict, btc_verisi: Optional[dict], bas_ms: int, bitis_ms: int) -> str:
+    degisimler = [d for d in (_donem_degisimi(v.get("15m"), bas_ms, bitis_ms) for v in coin_verileri.values())
+                  if d is not None]
+    btc_degisim = _donem_degisimi((btc_verisi or {}).get("1h"), bas_ms, bitis_ms)
+    btc_adi = "BTC (USDT)" if (btc_verisi or {}).get("sembol") == "BTCUSDT" else "BTC (TRY)"
+    return (f"test edilen coinler ayni donemde ortalama %{_ortalama(degisimler):+.1f}"
+            + (f", {btc_adi} %{btc_degisim:+.1f}" if btc_degisim is not None else ""))
 
 
 def backtest_raporu_satirlari(sonuc: dict, gun: int, coin_verileri: dict, btc_verisi: Optional[dict],
-                              bas_ms: int) -> list:
+                              bas_ms: int, bitis_ms: Optional[int] = None) -> list:
     bas, bit = sonuc["baslangic"], sonuc["bitis"]
     s = sonuc["sayac"]
-    degisimler = [d for d in (_donem_degisimi(v.get("15m"), bas_ms) for v in coin_verileri.values()) if d is not None]
-    btc_degisim = _donem_degisimi((btc_verisi or {}).get("1h"), bas_ms)
+    bitis_ms = bitis_ms or bas_ms + gun * ARALIK_MS["1d"]
     satirlar = [
-        f"Donem: son {gun} gun ({datetime.fromtimestamp(bas_ms / 1000).strftime('%d.%m.%Y')} - bugun) | "
-        f"{len(coin_verileri)} coin",
+        f"Donem: {gun} gun ({_tarih(bas_ms)} - {_tarih(bitis_ms)}) | {len(coin_verileri)} coin | "
+        f"puan baraji {ANALIZ_MIN_SKOR:.0f}",
         f"Sonuc: {bas:,.2f} -> {bit:,.2f} TRY ({bit - bas:+,.2f} TRY, %{(bit / bas - 1) * 100:+.2f})",
         f"En derin dusus: %{sonuc['en_derin_dusus'] * 100:.1f} | odenen komisyon: {s['komisyon']:,.2f} TRY | "
         f"pozisyonda gecen sure: %{s['acik_saat'] / max(1, s['toplam_saat']) * 100:.0f}",
     ] + islem_ozeti_satirlari(sonuc["islemler"]) + [
-        f"Kiyas: test edilen coinler ayni donemde ortalama %{_ortalama(degisimler):+.1f}"
-        + (f", BTC (USDT) %{btc_degisim:+.1f}" if btc_degisim is not None and btc_verisi
-           and btc_verisi.get("sembol") == "BTCUSDT" else
-           f", BTC (TRY) %{btc_degisim:+.1f}" if btc_degisim is not None else ""),
+        "Kiyas: " + _piyasa_kiyasi(coin_verileri, btc_verisi, bas_ms, bitis_ms),
         f"Risk korumasi: gunluk limit {len(s['gunluk_limit_gunleri'])} gun, kayip molasi {s['mola']} kez, "
         f"coin engeli {s['coin_engeli']} kez" + (" | ACIL FREN devreye girdi, test durdu" if s["acil_fren"] else ""),
     ]
@@ -6034,18 +6067,21 @@ def _backtest_argumanlari(argumanlar: list) -> tuple:
                          for x in (p.strip().upper() for p in a.split(",")) if x]
     gun = int(_aralikta(sayilar[0], *BACKTEST_GUN_ARALIGI)) if sayilar else BACKTEST_VARSAYILAN_GUN
     sermaye = sayilar[1] if len(sayilar) > 1 and sayilar[1] > 0 else BACKTEST_VARSAYILAN_SERMAYE
-    return gun, sermaye, semboller
+    geri = int(_aralikta(sayilar[2], 0, BACKTEST_MAKS_GERI_GUN)) if len(sayilar) > 2 else 0
+    return gun, sermaye, semboller, geri
 
 
 def backtest_komutu(argumanlar: list) -> int:
-    """'backtest [GUN] [SERMAYE] [SEMBOLLER]' - orn. 'backtest 90 1000' veya 'backtest 60 1000 PEPETRY,SOLTRY'."""
-    gun, sermaye, semboller = _backtest_argumanlari(argumanlar)
+    """'backtest [GUN] [SERMAYE] [GERI] [SEMBOLLER]' - orn. 'backtest 90 1000', 'backtest 60 1000 60'
+    (60 gun once biten 60 gunluk donem) veya 'backtest 60 1000 PEPETRY,SOLTRY'."""
+    gun, sermaye, semboller, geri = _backtest_argumanlari(argumanlar)
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
     print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v20 - GECMIS VERI TESTI'.center(74)}{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"  Son {gun} gun, {sermaye:,.0f} TL sanal sermaye. Emir gonderilmez; birkac dakika surebilir.\n")
-    bitis_ms = int(time.time() * 1000) // ARALIK_MS["1h"] * ARALIK_MS["1h"]
+    bitis_ms = (int(time.time() * 1000) // ARALIK_MS["1h"] * ARALIK_MS["1h"]) - geri * ARALIK_MS["1d"]
     bas_ms = bitis_ms - gun * ARALIK_MS["1d"]
+    print(f"  {_tarih(bas_ms)} - {_tarih(bitis_ms)} ({gun} gun), {sermaye:,.0f} TL sanal sermaye, puan baraji "
+          f"{ANALIZ_MIN_SKOR:.0f}. Emir gonderilmez; birkac dakika surebilir.\n")
     try:
         semboller = semboller or backtest_coinlerini_sec(BACKTEST_COIN_SAYISI)
     except Exception as e:
@@ -6067,7 +6103,7 @@ def backtest_komutu(argumanlar: list) -> int:
     print(f"\n{CYAN}{'-' * 74}{RESET}")
     print(f"{BOLD}  SONUC{RESET}")
     print(f"{CYAN}{'-' * 74}{RESET}")
-    for satir in backtest_raporu_satirlari(sonuc, gun, coin_verileri, btc_verisi, bas_ms):
+    for satir in backtest_raporu_satirlari(sonuc, gun, coin_verileri, btc_verisi, bas_ms, bitis_ms):
         print(f"  {satir}")
     print(f"{CYAN}{'-' * 74}{RESET}")
     print(f"{GRAY}  Varsayimlar: komisyon %{KOMISYON_PCT * 100:g} + kayma %{BACKTEST_SLIPAJ_PCT * 100:.3g} (her alim/satim), "
@@ -6076,6 +6112,77 @@ def backtest_komutu(argumanlar: list) -> int:
     print(f"{GRAY}  Islemlerin tamami: {BACKTEST_ISLEMLERI_CSV}{RESET}")
     print(f"{YELLOW}  Gecmis sonuc gelecegi garanti etmez.{RESET}\n")
     return CIKIS_DUR
+
+
+def karsilastir_komutu(argumanlar: list) -> int:
+    """'karsilastir [GUN] [SERMAYE] [SEMBOLLER]': puan barajlarini (55-75) iki ARDISIK donemde
+    (onceki GUN gun ve son GUN gun) ayni veriyle karsilastirir. Bir ayar ancak iki donemde de
+    iyiyse anlamlidir - tek donemde iyi gorunen ayar sans eseri olabilir."""
+    global ANALIZ_MIN_SKOR
+    gun, sermaye, semboller, _ = _backtest_argumanlari(argumanlar)
+    print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v20 - PUAN BARAJI KARSILASTIRMASI'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
+    son_ms = int(time.time() * 1000) // ARALIK_MS["1h"] * ARALIK_MS["1h"]
+    orta_ms = son_ms - gun * ARALIK_MS["1d"]
+    ilk_ms = orta_ms - gun * ARALIK_MS["1d"]
+    donemler = [("Onceki donem", ilk_ms, orta_ms), ("Son donem", orta_ms, son_ms)]
+    print(f"  Onceki donem: {_tarih(ilk_ms)} - {_tarih(orta_ms)} | Son donem: {_tarih(orta_ms)} - {_tarih(son_ms)}")
+    print(f"  {sermaye:,.0f} TL sanal sermaye, barajlar: {', '.join(map(str, KARSILASTIRMA_BARAJLARI))}. "
+          f"Emir gonderilmez; 5-10 dakika surebilir.\n")
+    try:
+        semboller = semboller or backtest_coinlerini_sec(BACKTEST_COIN_SAYISI)
+    except Exception as e:
+        print(f"{RED}Coin listesi alinamadi: {e}{RESET}")
+        return CIKIS_DUR
+    coin_verileri, btc_verisi = _backtest_verisini_indir(semboller, ilk_ms, son_ms)
+    if not coin_verileri:
+        print(f"{RED}Hicbir coin icin gecmis veri alinamadi (internet / Binance TR erisimini kontrol edin).{RESET}")
+        return CIKIS_DUR
+    eski_baraj = ANALIZ_MIN_SKOR
+    ANALIZ_MIN_SKOR = 0.0  # analiz bir kez yapilir, baraj simulasyonda uygulanir
+    sonuclar: dict = {}
+    try:
+        for ad, bas_ms, bitis_ms in donemler:
+            onbellek: dict = {}
+            for baraj in KARSILASTIRMA_BARAJLARI:
+                print(f"  {ad}, baraj {baraj} hesaplaniyor...", flush=True)
+                sonuclar[(ad, baraj)] = backtest_simule_et(coin_verileri, btc_verisi, bas_ms, bitis_ms, sermaye,
+                                                           min_skor=baraj, onbellek=onbellek)
+    finally:
+        ANALIZ_MIN_SKOR = eski_baraj
+    print(f"\n{CYAN}{'-' * 74}{RESET}")
+    print(f"{BOLD}  SONUC ({len(coin_verileri)} coin, her donem {gun} gun){RESET}")
+    print(f"{CYAN}{'-' * 74}{RESET}")
+    for satir in karsilastirma_satirlari(sonuclar, donemler, coin_verileri, btc_verisi):
+        print(f"  {satir}")
+    print(f"{CYAN}{'-' * 74}{RESET}")
+    print(f"{GRAY}  R/islem: islem basina ortalama sonuc (1R = stop olursa kaybedilen tutar). Bir baraj ancak IKI\n"
+          f"  donemde de artidaysa guvenilir; tek donemde iyi olan sans eseri olabilir.{RESET}")
+    print(f"{YELLOW}  Gecmis sonuc gelecegi garanti etmez.{RESET}\n")
+    return CIKIS_DUR
+
+
+def karsilastirma_satirlari(sonuclar: dict, donemler: list, coin_verileri: dict,
+                            btc_verisi: Optional[dict]) -> list:
+    satirlar = []
+    for ad, bas_ms, bitis_ms in donemler:
+        satirlar.append(f"{ad} ({_tarih(bas_ms)} - {_tarih(bitis_ms)}): "
+                        + _piyasa_kiyasi(coin_verileri, btc_verisi, bas_ms, bitis_ms))
+    satirlar.append("")
+    baslik = "Baraj | " + " | ".join(f"{ad:<34}" for ad, _, _ in donemler)
+    satirlar += [baslik, "      | " + " | ".join(f"{'islem kazanan R/islem    net TL':<34}" for _ in donemler)]
+    for baraj in KARSILASTIRMA_BARAJLARI:
+        hucreler = []
+        for ad, _, _ in donemler:
+            s = sonuclar[(ad, baraj)]
+            isl = s["islemler"]
+            kazanan = sum(1 for k in isl if k["net_kar_try"] > 0)
+            rler = [k["r_sonucu"] for k in isl if k.get("r_sonucu") is not None]
+            hucreler.append(f"{len(isl):>5} {(kazanan / len(isl) * 100 if isl else 0):>6.0f}% "
+                            f"{_ortalama(rler):>+8.2f} {s['bitis'] - s['baslangic']:>+10.2f}")
+        satirlar.append(f"{baraj:>5} | " + " | ".join(f"{h:<34}" for h in hucreler))
+    return satirlar
 
 
 def rapor_komutu() -> int:
@@ -6113,6 +6220,8 @@ def main():
             kod = backtest_komutu(sys.argv[2:])
         elif komut == "rapor":
             kod = rapor_komutu()
+        elif komut == "karsilastir":
+            kod = karsilastir_komutu(sys.argv[2:])
         elif komut == "baglanti":
             baglanti_testi()
             kod = CIKIS_DUR
