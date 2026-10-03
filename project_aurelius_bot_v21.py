@@ -2,6 +2,14 @@
 PROJECT AURELIUS - v21
 Binance TR otomatik alim-satim botu
 ======================================================================
+v22 - KISA VADELI STRATEJI TESTI ('kisavade [DONEM_GUN] [SERMAYE] [alt]', sadece test):
+  4 saatlik mumlarla uc kisa vadeli strateji ailesi 4 ardisik donemde (varsayilan 4 x 90 gun) denenir:
+   - 4s kirilim: kapanis son 5 gunun (30 mum) zirvesini kirar ve EMA100 ustunde; stop 2 x ATR, takip 3 x ATR.
+   - 4s geri cekilme: yukari trendde (EMA200 ustu) RSI(2) < 10; kapanis EMA5'i gecince ya da 2 gunde cikis.
+   - Haftalik momentum: her pazartesi 28 gunluk getirisi en yuksek 3 coin tutulur, digerleri satilir.
+  Hepsinde BTC (gunluk, USDT) EMA50 altindaysa yeni giris yok. Sonuc TL ve DOLAR (USDTTRY) bazinda,
+  gunluk/haftalik kazanan orani ve en kotu hafta ile raporlanir. 'alt' en hacimli altcoinleri de ekler.
+  Canli calisma degismez: bir strateji ancak her donemde artida kalirsa canliya alinmaya aday olur.
 v21 - GUNLUK TREND TAKIBI (VARSAYILAN STRATEJI):
   Gecmis veri testlerinde v19/v20'nin kisa vadeli stratejisi hicbir ayarla kar etmedi (cok fazla kucuk
   islem, masraflar ve oynak coinlerde stop). Gunluk trend takibi ise 3 yillik testte (4 x 270 gun) her
@@ -530,6 +538,7 @@ Kullanim:
     python project_aurelius_bot_v21.py karsilastir [GUN]        (puan barajlarini iki donemde karsilastirir)
     python project_aurelius_bot_v21.py strateji [GUN]           (farkli kurallari uc donemde karsilastirir)
     python project_aurelius_bot_v21.py trend [DONEM_GUN]        (gunluk trend takibini 4 donemde test eder)
+    python project_aurelius_bot_v21.py kisavade [DONEM_GUN] [SERMAYE] [alt]  (kisa vadeli stratejileri TL/dolar bazinda test eder)
 """
 
 import time
@@ -6839,6 +6848,327 @@ def trend_komutu(argumanlar: list) -> int:
     return CIKIS_DUR
 
 
+# ==========================================================================
+# v22: KISA VADELI STRATEJI TESTI ('kisavade' komutu - sadece test, canli calismayi degistirmez)
+# 4 saatlik mumlarla gunler/haftalar suren uc kisa vadeli strateji ailesi denenir; sonuc TL ve DOLAR
+# (USDTTRY ile) bazinda, gunluk/haftalik kazanan oraniyla raporlanir. Bir strateji ancak her donemde
+# artida kalirsa canliya alinmaya aday olur.
+# ==========================================================================
+KISAVADE_VARSAYILAN_DONEM_GUN = 90
+KISAVADE_ALT_SAYISI = 12            # 'alt' secenegiyle buyuk coinlere eklenen en hacimli TRY paritesi sayisi
+KISAVADE_ATR_PERIYOT = 20
+KISAVADE_GUN_BAR = 6                # 4 saatlik mum: gunde 6, haftada 42
+KISAVADE_HAFTA_BAR = 42
+KISAVADE_STRATEJILERI = [
+    # (ad, tur, ayarlar) - ilk_stop / takip: ATR(4s) katsayisi, takip 0 = takip eden stop yok
+    ("4s kirilim (5 gunluk zirve)", "kirilim",
+     {"kirilim": 30, "ema": 100, "ilk_stop": 2.0, "takip": 3.0, "maks": 4}),
+    ("4s geri cekilme (RSI2 < 10)", "geri",
+     {"ema": 200, "rsi_esik": 10.0, "cikis_ema": 5, "ilk_stop": 2.5, "takip": 0.0, "maks_bar": 12, "maks": 4}),
+    ("Haftalik momentum (en iyi 3)", "rotasyon",
+     {"geri_bar": 168, "ilk_stop": 6.0, "takip": 0.0, "maks": 3}),
+]
+
+
+def _rsi_serisi(kapanis: list, periyot: int) -> list:
+    """Wilder RSI, kapanis ile ayni uzunlukta (basta None)."""
+    sonuc = [None] * len(kapanis)
+    if len(kapanis) <= periyot:
+        return sonuc
+    farklar = [kapanis[i] - kapanis[i - 1] for i in range(1, len(kapanis))]
+    kazanc = sum(max(f, 0.0) for f in farklar[:periyot]) / periyot
+    kayip = sum(max(-f, 0.0) for f in farklar[:periyot]) / periyot
+    for i in range(periyot, len(kapanis)):
+        if i > periyot:
+            f = farklar[i - 1]
+            kazanc = (kazanc * (periyot - 1) + max(f, 0.0)) / periyot
+            kayip = (kayip * (periyot - 1) + max(-f, 0.0)) / periyot
+        sonuc[i] = 100.0 if kayip == 0 else 100 - 100 / (1 + kazanc / kayip)
+    return sonuc
+
+
+def _kisavade_sinyali(tur: str, ayar: dict, h: dict, i: int) -> Optional[tuple]:
+    """i. 4s mumun kapanisinda giris sinyali. Donus: (siralama puani - buyuk once, kapanis, ATR) veya None."""
+    v, kap, atr, ema = h["v"], h["v"]["kapanis"][i], h["atr"][i], h["ema"][i]
+    if not atr or not ema or kap <= ema:
+        return None
+    if tur == "kirilim":
+        n = ayar["kirilim"]
+        if i >= n and kap > max(v["yuksek"][i - n:i]):
+            return kap / v["kapanis"][max(0, i - KISAVADE_HAFTA_BAR)] - 1, kap, atr
+    elif tur == "geri":
+        rsi = h["rsi"][i]
+        if rsi is not None and rsi < ayar["rsi_esik"]:
+            return -rsi, kap, atr
+    elif tur == "rotasyon":
+        n = ayar["geri_bar"]
+        if i >= n:
+            getiri = kap / v["kapanis"][i - n] - 1
+            if getiri > 0:
+                return getiri, kap, atr
+    return None
+
+
+def kisavade_simule_et(coin_4s: dict, btc_gunluk: Optional[dict], bas_ms: int, bitis_ms: int, sermaye: float,
+                       tur: str, ayar: dict) -> dict:
+    """4 saatlik mumlarla kisa vadeli strateji simulasyonu. Kararlar mum kapanisinda (o ana kadarki veriyle),
+    stoplar sonraki mumdan itibaren gecerli. Butun stratejilerde BTC (gunluk) EMA50 ustunde degilse yeni
+    giris yok. Donus trend_simule_et ile ayni bicimde + 'degerler' [(zaman_ms, portfoy TL), ...]."""
+    adim, gun_ms = ARALIK_MS["4h"], ARALIK_MS["1d"]
+    hafta_ms = 7 * gun_ms
+    hazir = {}
+    for s, v in coin_4s.items():
+        if not v or len(v["zaman"]) < ayar.get("ema", 100) + 2:
+            continue
+        hazir[s] = {"v": v, "idx": {z: i for i, z in enumerate(v["zaman"])},
+                    "ema": _ema_hizali(v["kapanis"], ayar.get("ema", 100)),
+                    "atr": _atr_serisi(v["yuksek"], v["dusuk"], v["kapanis"], KISAVADE_ATR_PERIYOT),
+                    "rsi": _rsi_serisi(v["kapanis"], 2) if tur == "geri" else None,
+                    "cikis_ema": _ema_hizali(v["kapanis"], ayar["cikis_ema"]) if "cikis_ema" in ayar else None}
+    btc_yukari = {}
+    if btc_gunluk and btc_gunluk.get("zaman"):
+        e = _ema_hizali(btc_gunluk["kapanis"], TREND_EMA)
+        btc_yukari = {z: e[i] is not None and btc_gunluk["kapanis"][i] > e[i]
+                      for i, z in enumerate(btc_gunluk["zaman"])}
+    nakit, acik, islemler, son_fiyat, degerler = sermaye, {}, [], {}, []
+    zirve, en_derin = sermaye, 0.0
+    sayac = {"komisyon": 0.0, "acil_fren": False}
+
+    def sat(s: str, fiyat: float, etiket: str, t_ms: int) -> None:
+        nonlocal nakit
+        p = acik.pop(s)
+        brut = p["miktar"] * fiyat * (1 - BACKTEST_SLIPAJ_PCT)
+        kom = brut * KOMISYON_PCT
+        nakit += brut - kom
+        sayac["komisyon"] += kom
+        pnl = brut - kom - p["tutar"] - p["kom"]
+        islemler.append(islem_kaydi_olustur(
+            s, "TEST", datetime.fromtimestamp(p["giris_ms"] / 1000), datetime.fromtimestamp(t_ms / 1000),
+            p["giris"], fiyat, p["tutar"], pnl, p["miktar"] * (p["giris"] - p["ilk_stop"]),
+            (p["giris"] - p["ilk_stop"]) / p["giris"], etiket, False, False, {}))
+
+    t = bas_ms - bas_ms % adim
+    while t + adim <= bitis_ms:
+        kapanis_ms = t + adim
+        # 1) acik pozisyonlar: stop, ortalamaya donus / zaman asimi cikisi, takip eden stop
+        for s in list(acik):
+            h, p = hazir[s], acik[s]
+            i = h["idx"].get(t)
+            if i is None:
+                continue
+            v = h["v"]
+            son_fiyat[s] = v["kapanis"][i]
+            if v["dusuk"][i] <= p["stop"]:
+                sat(s, min(p["stop"], v["acilis"][i]),
+                    "TRAILING-STOP" if p["stop"] > p["giris"] else "STOP-LOSS", kapanis_ms)
+                continue
+            p["bar"] += 1
+            if tur == "geri":
+                ce = h["cikis_ema"][i]
+                if ce and v["kapanis"][i] > ce:
+                    sat(s, v["kapanis"][i], "ORTALAMAYA-DONUS", kapanis_ms)
+                    continue
+                if p["bar"] >= ayar["maks_bar"]:
+                    sat(s, v["kapanis"][i], "ZAMAN-ASIMI", kapanis_ms)
+                    continue
+            p["zirve"] = max(p["zirve"], v["yuksek"][i])
+            if ayar["takip"] and h["atr"][i]:
+                p["stop"] = max(p["stop"], p["zirve"] - ayar["takip"] * h["atr"][i])
+        for s, h in hazir.items():
+            i = h["idx"].get(t)
+            if i is not None:
+                son_fiyat[s] = h["v"]["kapanis"][i]
+        # 2) portfoy ve acil fren
+        deger = nakit + sum(p["miktar"] * son_fiyat[s] for s, p in acik.items())
+        degerler.append((kapanis_ms, deger))
+        zirve = max(zirve, deger)
+        en_derin = max(en_derin, (zirve - deger) / zirve if zirve > 0 else 0.0)
+        if zirve > 0 and (zirve - deger) / zirve >= MAX_DRAWDOWN_PCT:
+            for s in list(acik):
+                sat(s, son_fiyat[s], "ACIL-TASFIYE", kapanis_ms)
+            sayac["acil_fren"] = True
+            break
+        # 3) yeni girisler (mum kapanisinda); rotasyon sadece haftada bir (pazartesi 03:00 TR)
+        rotasyon_zamani = tur == "rotasyon" and (kapanis_ms - 4 * gun_ms) % hafta_ms == 0
+        if tur == "rotasyon" and not rotasyon_zamani:
+            t += adim
+            continue
+        btc_ok = btc_yukari.get(kapanis_ms // gun_ms * gun_ms - gun_ms, False) if btc_yukari else True
+        adaylar = []
+        if btc_ok:
+            for s, h in hazir.items():
+                i = h["idx"].get(t)
+                if i is None or (s in acik and tur != "rotasyon"):
+                    continue
+                sinyal = _kisavade_sinyali(tur, ayar, h, i)
+                if sinyal:
+                    adaylar.append((sinyal[0], s, sinyal[1], sinyal[2]))
+        secilen = sorted(adaylar, reverse=True)[:ayar["maks"]]
+        if tur == "rotasyon":
+            listede = {s for _, s, _, _ in secilen}
+            for s in list(acik):
+                if s not in listede:
+                    sat(s, son_fiyat[s], "ROTASYON", kapanis_ms)
+            deger = nakit + sum(p["miktar"] * son_fiyat[s] for s, p in acik.items())
+        bos = ayar["maks"] - len(acik)
+        for _, s, kap, atr in secilen:
+            if bos <= 0:
+                break
+            if s in acik:
+                continue
+            giris = kap * (1 + BACKTEST_SLIPAJ_PCT)
+            stop = giris - ayar["ilk_stop"] * atr
+            stop_pct = (giris - stop) / giris
+            if not (0 < stop_pct < 0.5):
+                continue
+            risk_tutari = deger * RISK_PCT / stop_pct if RISK_PCT > 0 else deger
+            tutar = min(risk_tutari, deger / ayar["maks"], nakit / (1 + KOMISYON_PCT))
+            if tutar < MIN_POZISYON_TUTARI_TRY:
+                continue
+            kom = tutar * KOMISYON_PCT
+            nakit -= tutar + kom
+            sayac["komisyon"] += kom
+            acik[s] = {"giris": giris, "miktar": tutar / giris, "tutar": tutar, "kom": kom, "stop": stop,
+                       "ilk_stop": stop, "zirve": giris, "giris_ms": kapanis_ms, "bar": 0}
+            bos -= 1
+        t += adim
+    for s in list(acik):
+        sat(s, son_fiyat[s], "TEST-SONU", min(t, bitis_ms))
+    if degerler:
+        degerler[-1] = (degerler[-1][0], nakit)
+    return {"baslangic": sermaye, "bitis": nakit, "islemler": islemler, "en_derin_dusus": en_derin,
+            "sayac": sayac, "degerler": degerler}
+
+
+def _usdtry_kuru(usdttry: Optional[dict], t_ms: int) -> Optional[float]:
+    """t_ms aninda bilinen son USDTTRY kapanisi (4s mumlar)."""
+    if not usdttry or not usdttry.get("zaman"):
+        return None
+    i = bisect.bisect_right(usdttry["zaman"], t_ms - ARALIK_MS["4h"]) - 1
+    return usdttry["kapanis"][i] if i >= 0 else None
+
+
+def _donemsel_getiriler(degerler: list, bar: int, usdttry: Optional[dict] = None) -> list:
+    """Portfoy serisinden her 'bar' mumda bir getiri (%); usdttry verilirse dolar bazinda."""
+    noktalar = []
+    for z, d in degerler[::bar] + ([degerler[-1]] if (len(degerler) - 1) % bar else []):
+        kur = _usdtry_kuru(usdttry, z) if usdttry else 1.0
+        if kur:
+            noktalar.append(d / kur)
+    return [(b / a - 1) * 100 for a, b in zip(noktalar, noktalar[1:]) if a > 0]
+
+
+def kisavade_ozet_satirlari(sonuc: dict, usdttry: Optional[dict]) -> list:
+    """TL ve dolar bazinda toplam getiri, gunluk/haftalik kazanan orani ve en kotu hafta."""
+    d = sonuc["degerler"]
+    if len(d) < 2:
+        return ["yeterli veri yok"]
+    tl_pct = (sonuc["bitis"] / sonuc["baslangic"] - 1) * 100
+    kur_bas, kur_son = _usdtry_kuru(usdttry, d[0][0]), _usdtry_kuru(usdttry, d[-1][0])
+    usd = (f"dolar bazinda %{((sonuc['bitis'] / kur_son) / (sonuc['baslangic'] / kur_bas) - 1) * 100:+.1f}"
+           if kur_bas and kur_son else "dolar bazi hesaplanamadi (USDTTRY yok)")
+    satirlar = [f"TL bazinda %{tl_pct:+.1f}, {usd}, en derin dusus %{sonuc['en_derin_dusus'] * 100:.1f}, "
+                f"{len(sonuc['islemler'])} islem, komisyon {sonuc['sayac']['komisyon']:,.0f} TL"
+                + (" - ACIL FREN" if sonuc["sayac"]["acil_fren"] else "")]
+    for ad, bar in (("Gunluk", KISAVADE_GUN_BAR), ("Haftalik", KISAVADE_HAFTA_BAR)):
+        g = _donemsel_getiriler(d, bar, usdttry)
+        if g:
+            satirlar.append(f"{ad} ({'$' if usdttry else 'TL'}): %{sum(1 for x in g if x > 0) / len(g) * 100:.0f}"
+                            f" artida, ortalama %{_ortalama(g):+.2f}, en iyi %{max(g):+.1f}, en kotu %{min(g):+.1f}")
+    return satirlar
+
+
+def _kisavade_coinleri(alt: bool) -> list:
+    coinler = list(TREND_COINLERI)
+    if alt:
+        try:
+            for s in backtest_coinlerini_sec(len(coinler) + KISAVADE_ALT_SAYISI):
+                if s not in coinler and len(coinler) < len(TREND_COINLERI) + KISAVADE_ALT_SAYISI:
+                    coinler.append(s)
+        except Exception as e:
+            print(f"{YELLOW}  Altcoin listesi alinamadi ({e}); sadece buyuk coinler test edilecek.{RESET}")
+    return coinler
+
+
+def kisavade_komutu(argumanlar: list) -> int:
+    """'kisavade [DONEM_GUN] [SERMAYE] [alt]': KISAVADE_STRATEJILERI'ni ardisik 4 donemde (varsayilan
+    4 x 90 gun = 1 yil) 4 saatlik mumlarla test eder; 'alt' en hacimli altcoinleri de ekler."""
+    sayilar, alt = [], False
+    for a in argumanlar:
+        if a.lower() == "alt":
+            alt = True
+            continue
+        try:
+            sayilar.append(float(a.replace(",", ".")))
+        except ValueError:
+            pass
+    donem_gun = int(_aralikta(sayilar[0], 30, 365)) if sayilar else KISAVADE_VARSAYILAN_DONEM_GUN
+    sermaye = sayilar[1] if len(sayilar) > 1 and sayilar[1] > 0 else BACKTEST_VARSAYILAN_SERMAYE
+    print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v22 - KISA VADELI STRATEJI TESTI'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
+    adim, gun_ms = ARALIK_MS["4h"], ARALIK_MS["1d"]
+    son_ms = int(time.time() * 1000) // gun_ms * gun_ms
+    sinirlar = [son_ms - k * donem_gun * gun_ms for k in (4, 3, 2, 1, 0)]
+    donemler = [(f"{i}. donem", sinirlar[i - 1], sinirlar[i]) for i in (1, 2, 3, 4)]
+    coinler = _kisavade_coinleri(alt)
+    print(f"  {_tarih(sinirlar[0])} - {_tarih(son_ms)}: 4 donem x {donem_gun} gun, {sermaye:,.0f} TL sanal sermaye, "
+          f"islem basina risk %{RISK_PCT * 100:g}.")
+    print(f"  {len(coinler)} coin: {', '.join(c[:-3] for c in coinler)}. Emir gonderilmez.\n")
+    isinma = 250 * adim
+    coin_4s = {}
+    for n, s in enumerate(coinler, start=1):
+        print(f"  [{n}/{len(coinler)}] {s} 4 saatlik mumlari indiriliyor...", flush=True)
+        try:
+            v = gecmis_mumlari_getir(s, "4h", sinirlar[0] - isinma, son_ms)
+        except Exception as e:
+            print(f"{YELLOW}    {s} atlandi ({e}){RESET}")
+            continue
+        if v:
+            coin_4s[s] = v
+    if not coin_4s:
+        print(f"{RED}Hicbir coin icin gecmis veri alinamadi (internet / Binance TR erisimini kontrol edin).{RESET}")
+        return CIKIS_DUR
+    try:
+        btc_gunluk = gecmis_mumlari_getir("BTCUSDT", "1d", sinirlar[0] - (TREND_EMA + 30) * gun_ms, son_ms)
+    except Exception:
+        btc_gunluk = None
+    try:
+        usdttry = gecmis_mumlari_getir("USDTTRY", "4h", sinirlar[0] - 10 * adim, son_ms)
+    except Exception:
+        usdttry = None
+    sonuclar = {}
+    for ad, tur, ayar in KISAVADE_STRATEJILERI:
+        for donem_adi, b, e in donemler:
+            sonuclar[(ad, donem_adi)] = kisavade_simule_et(coin_4s, btc_gunluk, b, e, sermaye, tur, ayar)
+    print(f"\n{CYAN}{'-' * 74}{RESET}")
+    print(f"{BOLD}  SONUC ({len(coin_4s)} coin){RESET}")
+    print(f"{CYAN}{'-' * 74}{RESET}")
+    for satir in strateji_satirlari(sonuclar, donemler, {}, None, [s[0] for s in KISAVADE_STRATEJILERI],
+                                    lambda b, e: trend_kiyasi(coin_4s, b, e)):
+        print(f"  {satir}")
+    print()
+    kur_bas, kur_son = _usdtry_kuru(usdttry, sinirlar[0]), _usdtry_kuru(usdttry, son_ms)
+    print(f"  Tum {4 * donem_gun} gun boyunca kesintisiz ({sermaye:,.0f} TL ile):  "
+          + trend_kiyasi(coin_4s, sinirlar[0], son_ms)
+          + (f" | dolar (USDTTRY) %{(kur_son / kur_bas - 1) * 100:+.1f}" if kur_bas and kur_son else ""))
+    for ad, tur, ayar in KISAVADE_STRATEJILERI:
+        print(f"    {BOLD}{ad}{RESET}")
+        for satir in kisavade_ozet_satirlari(
+                kisavade_simule_et(coin_4s, btc_gunluk, sinirlar[0], son_ms, sermaye, tur, ayar), usdttry):
+            print(f"      {satir}")
+    print(f"{CYAN}{'-' * 74}{RESET}")
+    print(f"{GRAY}  Varsayimlar: 4 saatlik mumlar; giris mum kapanisinda, stop sonraki mumdan itibaren; komisyon "
+          f"%{KOMISYON_PCT * 100:g} + kayma %{BACKTEST_SLIPAJ_PCT * 100:.3g} her alim/satimda (gidis-donus "
+          f"~%{(KOMISYON_PCT + BACKTEST_SLIPAJ_PCT) * 200:.2g}).{RESET}")
+    print(f"{GRAY}  Dolar bazi: portfoy degeri o anki USDTTRY kuruna bolunur (TL'nin deger kaybi ayiklanir). "
+          f"Gunluk/haftalik satirlar dolar bazindadir.{RESET}")
+    print(f"{GRAY}  Bir strateji ancak DORT donemde de artida ve dolar bazinda da kazancliysa canliya aday olur; "
+          f"'her gun/hafta kar' hicbir stratejide yoktur.{RESET}")
+    print(f"{YELLOW}  Gecmis sonuc gelecegi garanti etmez.{RESET}\n")
+    return CIKIS_DUR
+
+
 def rapor_komutu() -> int:
     """'rapor': islem gunlugunun tum zamanlar ve son 30 gun ozeti."""
     tumu = islem_gunlugunu_oku()
@@ -6880,6 +7210,8 @@ def main():
             kod = strateji_komutu(sys.argv[2:])
         elif komut == "trend":
             kod = trend_komutu(sys.argv[2:])
+        elif komut == "kisavade":
+            kod = kisavade_komutu(sys.argv[2:])
         elif komut == "baglanti":
             baglanti_testi()
             kod = CIKIS_DUR
