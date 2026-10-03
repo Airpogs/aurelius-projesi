@@ -23,6 +23,8 @@ v20 - RISK KORUMASI, ISLEM GUNLUGU VE GECMIS VERI TESTI:
      mumlarda calistirir ve rapor verir. Emir gondermez, anahtar gerektirmez.
      'backtest 60 1000 60' gecmisteki bir donemi (60 gun once biten 60 gun) test eder.
      'karsilastir [GUN]' puan barajlarini (55-75) iki ardisik donemde yan yana karsilastirir.
+     'strateji [GUN]' farkli kurallari (asiri oynak coinleri atlamak, genis stop, ek filtreler) uc
+     ardisik donemde karsilastirir.
 v19 - DETAYLI ANALIZ VE R TABANLI KAR ALMA:
   GIRIS: Bot bir coine girmeden once onu gunluk, 4 saatlik, 1 saatlik ve 15
   dakikalik mumlarla (her birinde ~200 kapanmis mum) inceler:
@@ -508,6 +510,7 @@ Kullanim:
     python project_aurelius_bot_v20.py analiz [SEMBOL]          (detayli analiz raporu, emir gondermez)
     python project_aurelius_bot_v20.py rapor                    (islem gunlugu ozeti)
     python project_aurelius_bot_v20.py karsilastir [GUN]        (puan barajlarini iki donemde karsilastirir)
+    python project_aurelius_bot_v20.py strateji [GUN]           (farkli kurallari uc donemde karsilastirir)
 """
 
 import time
@@ -5772,7 +5775,7 @@ class _GecmisSeri:
 
 def backtest_simule_et(coin_verileri: dict, btc_verisi: Optional[dict], bas_ms: int, bitis_ms: int,
                        sermaye: float, min_skor: Optional[float] = None,
-                       onbellek: Optional[dict] = None) -> dict:
+                       onbellek: Optional[dict] = None, ek_filtre=None) -> dict:
     """coin_verileri: {sembol: {"15m","1h","4h","1d","usd4h": gecmis_mumlari_getir ciktisi (veya None),
     "usd_sembol": str|None}}; btc_verisi: {"sembol", "1h", "4h", "1d"}. Islemler 15 dakikalik mumlarla
     yonetilir, yeni giris kararlari her saat basi (canli bot gibi tek seferde en yuksek puanli coin)."""
@@ -5934,7 +5937,8 @@ def backtest_simule_et(coin_verileri: dict, btc_verisi: Optional[dict], bas_ms: 
             if kapanis and t - kapanis[0] < _cooldown_suresi_hesapla(kapanis[1]) * 60_000:
                 continue
             a = analiz(sembol, t, btc)
-            if a.get("gecti") and (min_skor is None or a.get("skor", 0.0) >= min_skor):
+            if (a.get("gecti") and (min_skor is None or a.get("skor", 0.0) >= min_skor)
+                    and (ek_filtre is None or ek_filtre(a))):
                 adaylar.append(a)
         if not adaylar:
             continue
@@ -6185,6 +6189,114 @@ def karsilastirma_satirlari(sonuclar: dict, donemler: list, coin_verileri: dict,
     return satirlar
 
 
+# Strateji karsilastirmasi: ayni veriyle, ARDISIK uc donemde farkli kurallar. Bir degisiklik ancak
+# her donemde iyilestiriyorsa anlamlidir (tek donemde iyi gorunen sans eseri olabilir).
+def _asiri_oynak_degil(a: dict) -> bool:
+    """1.5 x ATR(1s) stop'u izin verilen en genis stop'u asiyorsa coin bu stop araligina gore fazla oynak:
+    stop %6'ya sikistirilinca normal dalgalanmayla tetikleniyor."""
+    return bool(a.get("fiyat")) and (a.get("atr_1h") or 0.0) * R_STOP_ATR_KATSAYI / a["fiyat"] <= R_STOP_MAKS_PCT
+
+
+STRATEJI_VARYANTLARI = [
+    # (ad, gecici ayarlar, ek giris filtresi)
+    ("Mevcut (v20)", {}, None),
+    ("Asiri oynak coin yok", {}, _asiri_oynak_degil),
+    ("Genis stop (2.5xATR, en fazla %10)", {"R_STOP_ATR_KATSAYI": 2.5, "R_STOP_MAKS_PCT": 0.10}, None),
+    ("Oynak yok + RSI>=50 + hacim>=0.8", {},
+     lambda a: _asiri_oynak_degil(a) and (a.get("rsi_1h") or 0) >= 50 and (a.get("goreceli_hacim") or 0) >= 0.8),
+    ("Oynak yok + BTC zayifken girme", {}, lambda a: _asiri_oynak_degil(a) and a.get("btc_rejim") != "ZAYIF"),
+]
+
+
+def strateji_karsilastir(coin_verileri: dict, btc_verisi: Optional[dict], donemler: list, sermaye: float,
+                         ilerleme: bool = True) -> dict:
+    """{(varyant_adi, donem_adi): simulasyon sonucu}. Ayarlar her varyanttan sonra geri yuklenir."""
+    sonuclar: dict = {}
+    for ad, ayarlar, filtre in STRATEJI_VARYANTLARI:
+        eski = {k: globals()[k] for k in ayarlar}
+        globals().update(ayarlar)
+        try:
+            for donem_adi, bas_ms, bitis_ms in donemler:
+                if ilerleme:
+                    print(f"  {ad} - {donem_adi} hesaplaniyor...", flush=True)
+                # analiz sonucu sadece ayarlara bagli: ayni ayarli varyantlar onbellegi paylasir
+                anahtar = (tuple(sorted(ayarlar.items())), donem_adi)
+                onbellek = _strateji_onbellegi.setdefault(anahtar, {})
+                sonuclar[(ad, donem_adi)] = backtest_simule_et(coin_verileri, btc_verisi, bas_ms, bitis_ms, sermaye,
+                                                               onbellek=onbellek, ek_filtre=filtre)
+        finally:
+            globals().update(eski)
+    _strateji_onbellegi.clear()
+    return sonuclar
+
+
+_strateji_onbellegi: dict = {}
+
+
+def _sonuc_hucresi(s: dict) -> tuple:
+    isl = s["islemler"]
+    rler = [k["r_sonucu"] for k in isl if k.get("r_sonucu") is not None]
+    return len(isl), _ortalama(rler), s["bitis"] - s["baslangic"]
+
+
+def strateji_satirlari(sonuclar: dict, donemler: list, coin_verileri: dict, btc_verisi: Optional[dict]) -> list:
+    satirlar = [f"{ad} ({_tarih(b)} - {_tarih(e)}): " + _piyasa_kiyasi(coin_verileri, btc_verisi, b, e)
+                for ad, b, e in donemler]
+    satirlar.append("")
+    genislik = 36
+    satirlar.append(f"{'Strateji':<{genislik}}| " + " | ".join(f"{ad:<22}" for ad, _, _ in donemler) + " | TOPLAM")
+    satirlar.append(f"{'':<{genislik}}| " + " | ".join(f"{'islem R/islem  net TL':<22}" for _ in donemler)
+                    + " | R/islem  net TL")
+    for ad, _, _ in STRATEJI_VARYANTLARI:
+        hucreler, toplam_islem, toplam_r, toplam_tl, hep_arti = [], 0, 0.0, 0.0, True
+        for donem_adi, _, _ in donemler:
+            n, r, tl = _sonuc_hucresi(sonuclar[(ad, donem_adi)])
+            hucreler.append(f"{n:>5} {r:>+7.2f} {tl:>+8.1f}")
+            toplam_islem += n
+            toplam_r += r * n
+            toplam_tl += tl
+            hep_arti = hep_arti and n > 0 and r > 0
+        isaret = "  <- her donemde arti" if hep_arti else ""
+        satirlar.append(f"{ad:<{genislik}}| " + " | ".join(f"{h:<22}" for h in hucreler)
+                        + f" | {toplam_r / max(1, toplam_islem):>+7.2f} {toplam_tl:>+8.1f}{isaret}")
+    return satirlar
+
+
+def strateji_komutu(argumanlar: list) -> int:
+    """'strateji [GUN] [SERMAYE] [SEMBOLLER]': STRATEJI_VARYANTLARI'ni ardisik uc donemde (her biri GUN gun,
+    varsayilan 60 -> son 180 gun) ayni veriyle karsilastirir."""
+    gun, sermaye, semboller, _ = _backtest_argumanlari(argumanlar)
+    print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v20 - STRATEJI KARSILASTIRMASI'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
+    son_ms = int(time.time() * 1000) // ARALIK_MS["1h"] * ARALIK_MS["1h"]
+    sinirlar = [son_ms - k * gun * ARALIK_MS["1d"] for k in (3, 2, 1, 0)]
+    donemler = [(f"{i}. donem", sinirlar[i - 1], sinirlar[i]) for i in (1, 2, 3)]
+    print(f"  {_tarih(sinirlar[0])} - {_tarih(son_ms)}: uc donem, her biri {gun} gun, {sermaye:,.0f} TL sanal sermaye.")
+    print(f"  {len(STRATEJI_VARYANTLARI)} strateji denenecek. Emir gonderilmez; 10-20 dakika surebilir.\n")
+    try:
+        semboller = semboller or backtest_coinlerini_sec(BACKTEST_COIN_SAYISI)
+    except Exception as e:
+        print(f"{RED}Coin listesi alinamadi: {e}{RESET}")
+        return CIKIS_DUR
+    coin_verileri, btc_verisi = _backtest_verisini_indir(semboller, sinirlar[0], son_ms)
+    if not coin_verileri:
+        print(f"{RED}Hicbir coin icin gecmis veri alinamadi (internet / Binance TR erisimini kontrol edin).{RESET}")
+        return CIKIS_DUR
+    print()
+    sonuclar = strateji_karsilastir(coin_verileri, btc_verisi, donemler, sermaye)
+    print(f"\n{CYAN}{'-' * 74}{RESET}")
+    print(f"{BOLD}  SONUC ({len(coin_verileri)} coin, puan baraji {ANALIZ_MIN_SKOR:.0f}){RESET}")
+    print(f"{CYAN}{'-' * 74}{RESET}")
+    for satir in strateji_satirlari(sonuclar, donemler, coin_verileri, btc_verisi):
+        print(f"  {satir}")
+    print(f"{CYAN}{'-' * 74}{RESET}")
+    print(f"{GRAY}  R/islem: islem basina ortalama sonuc (1R = stop olursa kaybedilen tutar). Bir strateji ancak UC\n"
+          f"  donemde de artidaysa umut verir; yine de once kucuk tutarla denenmelidir.{RESET}")
+    print(f"{YELLOW}  Gecmis sonuc gelecegi garanti etmez.{RESET}\n")
+    return CIKIS_DUR
+
+
 def rapor_komutu() -> int:
     """'rapor': islem gunlugunun tum zamanlar ve son 30 gun ozeti."""
     tumu = islem_gunlugunu_oku()
@@ -6222,6 +6334,8 @@ def main():
             kod = rapor_komutu()
         elif komut == "karsilastir":
             kod = karsilastir_komutu(sys.argv[2:])
+        elif komut == "strateji":
+            kod = strateji_komutu(sys.argv[2:])
         elif komut == "baglanti":
             baglanti_testi()
             kod = CIKIS_DUR
