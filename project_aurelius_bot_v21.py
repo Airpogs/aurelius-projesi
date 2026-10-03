@@ -4837,8 +4837,10 @@ def print_performans_raporu(kasa: MerkeziKasa, pozisyonlar: dict, acik_pozisyon_
     else:
         print(f"  {YELLOW}Su an acik pozisyon yok - nakitte bekleniyor.{RESET}")
 
-    beklemede_olanlar = [b for b in pozisyonlar.values() if b.bekliyor]
-    cooldown_olanlar = [b for b in pozisyonlar.values() if not b.has_open_position and b.cooldown_aktif_mi()]
+    # v21: RSI beklemesi ve cooldown sadece kisa vadeli stratejide kullanilir
+    beklemede_olanlar = [] if TREND_MODU else [b for b in pozisyonlar.values() if b.bekliyor]
+    cooldown_olanlar = [] if TREND_MODU else [b for b in pozisyonlar.values()
+                                              if not b.has_open_position and b.cooldown_aktif_mi()]
     if beklemede_olanlar:
         print(f"  {YELLOW}RSI asiri alimda bekleyen: {', '.join(b.symbol for b in beklemede_olanlar)}{RESET}")
     if cooldown_olanlar:
@@ -5545,6 +5547,8 @@ def run_simulation():
                       + (trend_durum_satiri() if TREND_MODU else "Strateji: KISA (detayli analiz)"))
     _risk_baslat(kasa, v9_toplam_portfoy_degeri(kasa, pozisyonlar), risk_kayitli)  # v20
     if TREND_MODU:
+        for b in pozisyonlar.values():
+            b.bekliyor = False  # eski stratejinin RSI beklemesi trend stratejisinde anlamsiz
         print(f"{CYAN}  {trend_durum_satiri()}{RESET}")
         print(f"{GRAY}  Gunluk kontrol her gun TR saatiyle ~03:{TREND_KONTROL_GECIKME_DK:02d}'te (gunluk mum "
               f"kapanisindan sonra); bot o saatte kapaliysa acilinca yapilir.{RESET}\n")
