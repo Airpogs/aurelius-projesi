@@ -1,7 +1,23 @@
 """
-PROJECT AURELIUS - v20
-Binance TR AKILLI SECIM Grid Trading Bot - PIYASA ADAPTIF MOTOR VE OTONOM SERMAYE DONGUSU
+PROJECT AURELIUS - v21
+Binance TR otomatik alim-satim botu
 ======================================================================
+v21 - GUNLUK TREND TAKIBI (VARSAYILAN STRATEJI):
+  Gecmis veri testlerinde v19/v20'nin kisa vadeli stratejisi hicbir ayarla kar etmedi (cok fazla kucuk
+  islem, masraflar ve oynak coinlerde stop). Gunluk trend takibi ise 3 yillik testte (4 x 270 gun) her
+  donemde artida kaldi ('trend 270' komutu). v21 bu stratejiyi canli/simulasyon calismaya ekler:
+   - Coinler: BTC, ETH, BNB, SOL, XRP, ADA, AVAX, DOGE, LINK, DOT, TRX, LTC (TRY pariteleri).
+   - Gunde bir kez, gunluk mum kapanisindan sonra (TR ~03:05): gunluk kapanis son 50 gunun zirvesini
+     kirdiysa, EMA50 ustundeyse ve BTC (USDT) EMA50 ustundeyse alim. En fazla 4 pozisyon, en guclu
+     (60 gunluk getirisi en yuksek) once.
+   - Stop: giris - 2 x ATR(20, gunluk); her gun zirve - 3 x ATR'ye yukselir, asla inmez. Hedef ve
+     kismi kar alma yok - kazanan islem kosar. Gun icinde fiyat stop'a degerse satilir.
+   - Islem basina risk AURELIUS_RISK_PCT (varsayilan %1), pozisyon en fazla portfoyun 1/4'u.
+   - Acil fren (zirveden %20) gecerli; gunluk limit / mola / coin engeli trend stratejisinde
+     uygulanmaz (test edilen kurallarda yoktu).
+  Ayarlar: AURELIUS_STRATEJI=KISA (eski strateji), AURELIUS_TREND_KIRILIM (varsayilan 50),
+  AURELIUS_TREND_BTC_FILTRE=0 (BTC filtresini kapatir). Acik eski pozisyonlar kendi kurallariyla
+  yonetilmeye devam eder. Telegram performans ozeti artik 2 dk'da bir degil, durum bildirimiyle gider.
 v20 - RISK KORUMASI, ISLEM GUNLUGU VE GECMIS VERI TESTI:
   1) Islem basina risk: pozisyon, stop olursa kaybin portfoyun en fazla
      AURELIUS_RISK_PCT'si (varsayilan %1) olacagi buyuklukte acilir (eskiden
@@ -51,7 +67,7 @@ v18 - KESINTI ONLEMLERI (bot kapaliyken pozisyonlar korumasiz kalmasin):
      saatte bir Telegram'a portfoy ozeti. AURELIUS_SAGLIK_URL verilirse
      (orn. healthchecks.io ping adresi) 5 dk'da bir "calisiyorum" sinyali;
      sinyal kesilirse (elektrik kesintisi dahil) o servis size haber verir.
-  2) Otomatik yeniden baslatma: 'python project_aurelius_bot_v20.py kurulum'
+  2) Otomatik yeniden baslatma: 'python project_aurelius_bot_v21.py kurulum'
      bu penceredeki ayarlarla baslat.bat (Linux: baslat.sh) olusturur; bot
      coker/baslayamazsa 60 sn sonra yeniden baslar. Istege bagli: Windows
      oturumu acilinca otomatik baslatma. Cikis kodlari: 0 bilincli durdurma,
@@ -507,13 +523,13 @@ YAPMAZ; her emir tek seferde MARKET emri olarak gonderilir ve sonucu
 dogrudan API yanitindan okunur.
 
 Kullanim:
-    python project_aurelius_bot_v20.py                          (canli/simulasyon - CANLI_MOD bayragina gore)
-    python project_aurelius_bot_v20.py backtest [GUN] [SERMAYE] [SEMBOLLER]  (gecmis veri testi, emir gondermez)
-    python project_aurelius_bot_v20.py analiz [SEMBOL]          (detayli analiz raporu, emir gondermez)
-    python project_aurelius_bot_v20.py rapor                    (islem gunlugu ozeti)
-    python project_aurelius_bot_v20.py karsilastir [GUN]        (puan barajlarini iki donemde karsilastirir)
-    python project_aurelius_bot_v20.py strateji [GUN]           (farkli kurallari uc donemde karsilastirir)
-    python project_aurelius_bot_v20.py trend [DONEM_GUN]        (gunluk trend takibini 4 donemde test eder)
+    python project_aurelius_bot_v21.py                          (canli/simulasyon - CANLI_MOD bayragina gore)
+    python project_aurelius_bot_v21.py backtest [GUN] [SERMAYE] [SEMBOLLER]  (gecmis veri testi, emir gondermez)
+    python project_aurelius_bot_v21.py analiz [SEMBOL]          (detayli analiz raporu, emir gondermez)
+    python project_aurelius_bot_v21.py rapor                    (islem gunlugu ozeti)
+    python project_aurelius_bot_v21.py karsilastir [GUN]        (puan barajlarini iki donemde karsilastirir)
+    python project_aurelius_bot_v21.py strateji [GUN]           (farkli kurallari uc donemde karsilastirir)
+    python project_aurelius_bot_v21.py trend [DONEM_GUN]        (gunluk trend takibini 4 donemde test eder)
 """
 
 import time
@@ -839,6 +855,17 @@ BASLANGIC_SERMAYE_TRY = max(0.0, _ortam_sayisi_oku("AURELIUS_BASLANGIC_SERMAYE",
 SERMAYE_HAREKETI_MIN_TRY = 5.0       # mutabakatta bundan (ve portfoyun %1'inden) buyuk TRY farki
 SERMAYE_HAREKETI_MIN_ORAN = 0.01     # para yatirma/cekme sayilir
 FREN_SIFIRLA = _ortam_degiskeni_str_oku("AURELIUS_FREN_SIFIRLA") == "1"
+
+# v21 STRATEJI SECIMI: TREND (varsayilan, gunluk trend takibi - 3 yillik testte her donemde arti) veya
+# KISA (v19/v20 kisa vadeli detayli analiz stratejisi - testlerde kaybettirdi, sadece karsilastirma icin).
+STRATEJI = (_ortam_degiskeni_str_oku("AURELIUS_STRATEJI") or "TREND").upper()
+TREND_MODU = STRATEJI != "KISA"
+TREND_KIRILIM_GUN = int(_aralikta(_ortam_sayisi_oku("AURELIUS_TREND_KIRILIM", 50), 10, 100))
+TREND_BTC_FILTRESI = _ortam_degiskeni_str_oku("AURELIUS_TREND_BTC_FILTRE") != "0"
+TREND_KONTROL_GECIKME_DK = 5        # gunluk mum 00:00 UTC'de (TR 03:00) kapanir; bu kadar dakika sonra kontrol
+TREND_KOVALAMA_ATR = 0.5            # fiyat sinyal kapanisindan 0.5 x ATR'den fazla kactiysa girilmez
+TREND_GUNLUK_MUM = 300              # gunluk kontrolde cekilen gecmis (tek istek)
+_trend_durumu: dict = {}            # {"son_gun": ms} - durum dosyasina kaydedilir
 
 REAL_POLL_INTERVAL_SECONDS = 25
 SUB_TICK_SECONDS = 2
@@ -1171,13 +1198,13 @@ class RiskKorumasi:
 
     def durum_satirlari(self, portfoy: float, simdi: Optional[datetime] = None) -> list:
         simdi = simdi or datetime.now()
-        satirlar = [f"Risk: islem basina %{RISK_PCT * 100:g} | bugun %{self.gunluk_degisim(portfoy) * 100:+.1f} "
-                    f"(limit -%{GUNLUK_ZARAR_LIMIT_PCT * 100:g}) | zirveden -%{self.zirveden_dusus(portfoy) * 100:.1f} "
-                    f"(acil fren %{MAX_DRAWDOWN_PCT * 100:.0f})"]
+        satirlar = [f"Risk: islem basina %{RISK_PCT * 100:g} | bugun %{self.gunluk_degisim(portfoy) * 100:+.1f}"
+                    + ("" if TREND_MODU else f" (limit -%{GUNLUK_ZARAR_LIMIT_PCT * 100:g})")
+                    + f" | zirveden -%{self.zirveden_dusus(portfoy) * 100:.1f} (acil fren %{MAX_DRAWDOWN_PCT * 100:.0f})"]
         engel = self.yeni_alim_engeli(portfoy, simdi)
-        if engel:
+        if engel and (not TREND_MODU or engel[0] == "FREN"):  # trend modunda sadece acil fren uygulanir
             satirlar.append(f"Yeni alim engeli: {engel[1]}")
-        engelli = sorted((s, t) for s, t in self.coin_engel.items() if t > simdi)
+        engelli = [] if TREND_MODU else sorted((s, t) for s, t in self.coin_engel.items() if t > simdi)
         if engelli:
             satirlar.append("Engelli coinler: " + ", ".join(f"{s} ({t.strftime('%d.%m %H:%M')})" for s, t in engelli))
         return satirlar
@@ -1520,6 +1547,8 @@ def durumu_kaydet(kasa: "MerkeziKasa", pozisyonlar: dict, rapor: "RaporlamaDurum
             "kasa_toplam_komisyon": kasa.toplam_komisyon,
             "kaydedilme_zamani": datetime.now().isoformat(),
             "risk": _risk.to_dict(),  # v20
+            "strateji": STRATEJI,  # v21
+            "trend": _trend_durumu,
             "pozisyonlar": {},
         }
         if rapor is not None:
@@ -1561,6 +1590,7 @@ def durumu_kaydet(kasa: "MerkeziKasa", pozisyonlar: dict, rapor: "RaporlamaDurum
                         "atr_giris": lvl.atr_giris,
                         "tp1_alindi": lvl.tp1_alindi,
                         "tp2_alindi": lvl.tp2_alindi,
+                        "trend_stop": lvl.trend_stop,  # v21
                     }
                     for lvl in b.grid
                 ],
@@ -1680,6 +1710,7 @@ def durumdan_kasa_ve_pozisyonlar_olustur(veri: dict):
                 atr_giris=lvl.get("atr_giris", 0.0),
                 tp1_alindi=lvl.get("tp1_alindi", False),
                 tp2_alindi=lvl.get("tp2_alindi", False),
+                trend_stop=lvl.get("trend_stop", 0.0),  # v21
             )
             for lvl in p.get("grid", [])
         ]
@@ -1822,7 +1853,7 @@ def _ag_hatasi_ipucu(hata: Exception) -> None:
         f"Python'un kullandigi proxy: {proxyler or 'yok'}",
         "Ne yapmali: VPN'i kapatip/acip, antivirusun HTTPS taramasini gecici kapatip veya",
         "baska bir aga (orn. telefon hotspot) gecip tekrar deneyin. Ayrintili teshis icin:",
-        "    python project_aurelius_bot_v20.py baglanti",
+        "    python project_aurelius_bot_v21.py baglanti",
     ]
     if proxyler:
         satirlar.append("Proxy'yi bu pencerede devre disi birakmak icin:  set NO_PROXY=*")
@@ -1864,7 +1895,7 @@ def _ham_yanit_ozeti(ham: bytes) -> str:
 
 def baglanti_testi() -> None:
     """
-    'python project_aurelius_bot_v20.py baglanti' ile calisir. API anahtari
+    'python project_aurelius_bot_v21.py baglanti' ile calisir. API anahtari
     GEREKTIRMEZ, emir GONDERMEZ. Binance TR'ye giden yolu adim adim test
     eder (DNS -> TLS el sikisma -> ozel API sunucusu -> piyasa verisi
     sunucusu) ve sorunun nerede oldugunu gosterir.
@@ -2501,6 +2532,7 @@ class GridLevel:
     atr_giris: float = 0.0              # giristeki ATR(1s) - takip eden stop mesafesi
     tp1_alindi: bool = False
     tp2_alindi: bool = False
+    trend_stop: float = 0.0             # v21: trend pozisyonunun guncel stop'u (0 = trend pozisyonu degil)
 
 
 def r_stop_hesapla(level: GridLevel) -> tuple:
@@ -2889,7 +2921,10 @@ class CoinBot:
         dondurur (islem yapmaz) - hem stop_loss_kontrol() icinde HEM DE
         raporlama/giris karti icin (guncel_stop_seviyesi gostermek icin)
         tekrar kullanilir. Donus: (stop_seviyesi, etiket).
-        v19: R bilgisi olan (canli) pozisyonlarda _r_stop_hesapla kullanilir."""
+        v19: R bilgisi olan (canli) pozisyonlarda _r_stop_hesapla kullanilir.
+        v21: trend pozisyonunda gunluk guncellenen trend_stop."""
+        if level.trend_stop > 0:
+            return level.trend_stop, ("TRAILING-STOP" if level.trend_stop > level.buy_price else "STOP-LOSS")
         if level.risk_birimi > 0:
             return self._r_stop_hesapla(level)
         peak = level.en_yuksek_fiyat
@@ -2934,6 +2969,9 @@ class CoinBot:
         (v14'teki 'Hedef < Stop' tutarsizligini onlemek icin - trailing
         aktifken zaten cikis o mekanizma tarafindan yonetilir)."""
         for i, level in enumerate(self.grid):
+            if level.has_position and level.trend_stop > 0:
+                stop, etiket = self._ratchet_stop_hesapla(level)
+                return "TREND", stop, etiket  # v21: hedef yok, takip eden stop
             if level.has_position and level.risk_birimi > 0:
                 stop, etiket = self._r_stop_hesapla(level)
                 if not level.tp1_alindi:
@@ -3249,7 +3287,8 @@ class CoinBot:
         if risk_try > 0:
             print(f"[{ts()}] {MAGENTA}{self.symbol:<9}{RESET} islem kapandi: {toplam:+,.2f} TRY "
                   f"({kayit['r_sonucu']:+.2f}R)")
-        for mesaj in _risk.islem_kapandi(self.symbol, toplam, tag, simdi):
+        mesajlar = [] if TREND_MODU else _risk.islem_kapandi(self.symbol, toplam, tag, simdi)
+        for mesaj in mesajlar:
             print(f"[{ts()}] {YELLOW}RISK KORUMASI: {mesaj}{RESET}")
             if self.bildirim_aktif:
                 send_telegram(f"\U0001F6E1 <b>Risk korumasi</b>\n{html.escape(mesaj)}")
@@ -3275,6 +3314,13 @@ class CoinBot:
 
             if price > level.en_yuksek_fiyat:
                 level.en_yuksek_fiyat = price
+
+            if kasa is not None and level.trend_stop > 0:
+                # v21: trend pozisyonu - kismi kar alma / zaman asimi yok, sadece gunluk yukselen stop
+                stop, etiket = self._ratchet_stop_hesapla(level)
+                if price <= stop:
+                    self._satisi_uygula(level, price, etiket, sim, kasa, acik_pozisyon_sayaci, rapor, durum_kaydet)
+                continue
 
             if kasa is not None and level.risk_birimi > 0:
                 self._r_cikis_yonetimi(level, price, sim, kasa, acik_pozisyon_sayaci, rapor, durum_kaydet)
@@ -3642,6 +3688,59 @@ class CoinBot:
                 if price < hedef_fiyat_bu_seviye:
                     continue
                 self._satisi_uygula(level, price, "KAR-AL", sim, kasa, acik_pozisyon_sayaci, rapor, durum_kaydet)
+
+    def trend_girisi(self, fiyat: float, tutar: float, stop_pct: float, kasa: MerkeziKasa,
+                     acik_pozisyon_sayaci: list, rapor: Optional["RaporlamaDurumu"], durum_kaydet,
+                     portfoy: float, btc_yukari: Optional[bool]) -> bool:
+        """v21: trend stratejisi alimi. Stop giristen stop_pct asagida; gunluk kontrolde zirve - 3 x ATR'ye
+        kadar yukselir (asla inmez). Kismi kar alma yok. CANLI modda gercek emir; reddedilirse False."""
+        exec_price = self._slipajli_fiyat(fiyat, "ALIM")
+        buy_qty = tutar / exec_price
+        if CANLI_MOD:
+            dogrulanmis_qty = self._canli_emir_dogrula_ve_gonder("BUY", buy_qty, exec_price)
+            if dogrulanmis_qty is None:
+                return False
+            buy_qty = dogrulanmis_qty
+            tutar = buy_qty * exec_price
+        komisyon = tutar * KOMISYON_PCT
+        kasa.harca(tutar, komisyon)
+        self.starting_try = tutar
+        self.cash_try = -komisyon
+        self.coin_qty += buy_qty
+        self.toplam_komisyon += komisyon
+        stop = exec_price * (1 - stop_pct)
+        self.grid = [GridLevel(price=exec_price, has_position=True, buy_qty=buy_qty, buy_price=exec_price,
+                               en_yuksek_fiyat=exec_price, risk_birimi=exec_price - stop, ilk_stop=stop,
+                               atr_giris=exec_price * stop_pct / TREND_ILK_STOP_ATR, trend_stop=stop)]
+        self.initialized = True
+        self.bekliyor = False
+        self.alis_zamani = datetime.now()
+        self.giris_bilgi = {"zaman": self.alis_zamani.isoformat(), "miktar": buy_qty, "tutar": tutar,
+                            "komisyon": komisyon,
+                            "analiz": {"btc_rejimi": ("YUKARI" if btc_yukari else "BILINMIYOR" if btc_yukari is None
+                                                      else "ASAGI")}}
+        self.acik_islem_pnl = 0.0
+        acik_pozisyon_sayaci[0] += 1
+        if rapor is not None:
+            rapor.islem_kaydet(self.symbol, "ALIM", komisyon, None)
+        self.record("ALIM", exec_price, buy_qty, tutar)
+        print_trade_line(self.symbol, "ALIM", exec_price, buy_qty, tutar, kasa.bakiye, self.coin_name,
+                         False, komisyon=komisyon, telegram_bildir=False)
+        risk_try = buy_qty * (exec_price - stop)
+        mesaj = (f"\U0001F7E2 <b>TREND ALIMI: {self.symbol}</b>\n"
+                 f"Fiyat: {format_fiyat(exec_price)} TRY | Tutar: {tutar:,.2f} TRY\n"
+                 f"Stop: {format_fiyat(stop)} TRY (-%{stop_pct * 100:.1f}) | stop olursa ~{risk_try:,.2f} TRY "
+                 f"(portfoyun %{risk_try / portfoy * 100 if portfoy else 0:.1f}'i)\n"
+                 f"Sinyal: {TREND_KIRILIM_GUN} gunluk zirve kirildi"
+                 + (", BTC yukselis trendinde" if btc_yukari else "") + "\n"
+                 "Hedef yok: fiyat yukseldikce stop her gun yukari tasinir.")
+        print(f"{GREEN}{BOLD}\U0001F7E2 [TREND POZISYONU ACILDI]{RESET} {self.symbol}: stop {format_fiyat(stop)} "
+              f"(-%{stop_pct * 100:.1f}), risk ~{risk_try:,.2f} TRY")
+        if self.bildirim_aktif:
+            send_telegram(mesaj)
+        if durum_kaydet is not None:
+            durum_kaydet()
+        return True
 
     def acil_tasfiye(self, current_price: float, kasa: MerkeziKasa,
                       durum_kaydet: Optional[object] = None,
@@ -4457,44 +4556,52 @@ def coin_degerlendir_ve_sec(semboller: list, sayisi: int):
 
 def print_banner():
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - v20'.center(74)}{RESET}")
-    print(f"{BOLD}{CYAN}  BINANCE TR AKILLI SECIM GRID BOT  |  PIYASA ADAPTIF MOTOR{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS - v21'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}  BINANCE TR OTOMATIK ALIM-SATIM BOTU  |  {'GUNLUK TREND TAKIBI' if TREND_MODU else 'KISA VADELI ANALIZ'}{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
     if CANLI_MOD:
         print(f"{RED}{BOLD}  !!! CANLI_MOD = True: BU BOT GERCEK PARA ILE GERCEK EMIR GONDERECEK !!!{RESET}")
     else:
         print(f"{YELLOW}  DRY-RUN (SIMULASYON) modunda. Gercek emir gonderilmiyor.{RESET}")
     print(f"{GRAY}  Calisma modu       : {'CANLI (GERCEK PARA)' if CANLI_MOD else 'SIMULASYON'}{RESET}")
+    if TREND_MODU:
+        print(f"{CYAN}{BOLD}  Strateji           : TREND - {', '.join(c[:-3] for c in TREND_COINLERI)}{RESET}")
+        print(f"{CYAN}                       gunluk kapanis {TREND_KIRILIM_GUN} gunun zirvesini kirinca ve EMA{TREND_EMA} "
+              f"ustundeyken alim{' (BTC EMA50 ustundeyse)' if TREND_BTC_FILTRESI else ''};{RESET}")
+        print(f"{CYAN}                       stop {TREND_ILK_STOP_ATR:g} x ATR, her gun zirve - {TREND_TAKIP_ATR:g} x ATR'ye "
+              f"yukselir; en fazla {TREND_MAKS_POZISYON} pozisyon, islem basina risk %{RISK_PCT * 100:g}{RESET}")
+        print(f"{GRAY}                       (eski kisa vadeli strateji icin AURELIUS_STRATEJI=KISA){RESET}")
     print(f"{GRAY}  Sanal/baslangic kasa: {TOPLAM_SANAL_BAKIYE_TRY:,.0f} TRY{RESET}")
-    print(f"{GRAY}  Pozisyon modeli    : < {SNIPER_MODU_ESIGI_TRY:,.0f} TRY -> SNIPER MODU (kesinlikle 1 pozisyon),{RESET}")
-    print(f"{GRAY}                       {SNIPER_MODU_ESIGI_TRY:,.0f}-{KADEME_2_ESIGI_TRY:,.0f}:2 / "
-          f"{KADEME_2_ESIGI_TRY:,.0f}-{KADEME_3_ESIGI_TRY:,.0f}:3 / {KADEME_3_ESIGI_TRY:,.0f}-{KADEME_4_ESIGI_TRY:,.0f}:4 / "
-          f">={KADEME_4_ESIGI_TRY:,.0f}:{KASA_KAPASITESI_TAVAN} (tavan){RESET}")
-    print(f"{GRAY}                       taban pozisyon {TABAN_POZISYON_TUTARI:,.0f} TRY, "
-          f"BTC 24s gucune gore tam/yari/sifir kapasite{RESET}")
-    print(f"{GRAY}  Kalite onceligi    : ADX>={ADX_MIN_ESIK} VE RSI {RSI_KALITE_ALT_ESIK}-{RSI_KALITE_UST_ESIK} - "
-          f"bos slotta bile sadece en yuksek ADX'li aday alinir{RESET}")
-    print(f"{GRAY}  Cooldown           : {COOLDOWN_MINUTES} dk (satistan sonra yeniden alim kilidi){RESET}")
-    print(f"{GRAY}  Izleme listesi     : esnek, {MIN_WATCHLIST}-{MAX_WATCHLIST} coin arasi{RESET}")
-    print(f"{GRAY}  Firsat taramasi    : her ~{SCAN_INTERVAL_MINUTES} dk{RESET}")
-    print(f"{GRAY}  Varlik yenileme    : her ~{ASSET_REFRESH_HOURS} saat{RESET}")
-    print(f"{GRAY}  BTC dusus esigi    : %{BTC_DUSUS_ESIGI_PCT:.0f}{RESET}")
     print(f"{GRAY}  Spread filtresi    : max %{MAX_SPREAD_PCT} (ustunde ALIM iptal edilir){RESET}")
     print(f"{GRAY}  Komisyon           : %{KOMISYON_PCT * 100:.2f}{RESET}")
     print(f"{GRAY}  Slipaj araligi     : %{SLIPAJ_MIN_PCT * 100:.2f} - %{SLIPAJ_MAKS_PCT * 100:.2f}{RESET}")
-    print(f"{GRAY}  Trend filtresi     : EMA{EMA_PERIYOT}, esik %{TREND_ESIK_PCT * 100:.1f}{RESET}")
-    print(f"{GRAY}  RSI giris filtresi : asiri alim>={RSI_ASIRI_ALIM_ESIGI} beklemeye alinir, "
-          f"giris icin RSI {RSI_KALITE_ALT_ESIK}-{RSI_KALITE_UST_ESIK}{RESET}")
-    print(f"{GRAY}  Detayli analiz     : gunluk/4s/1s/15dk trend, hacim, destek-direnc, USDT paritesi, "
-          f"BTC rejimi (min puan {ANALIZ_MIN_SKOR:.0f}){RESET}")
-    print(f"{GRAY}  Stop (1R)          : destegin alti veya {R_STOP_ATR_KATSAYI:g} x ATR(1s), "
-          f"%{R_STOP_MIN_PCT * 100:.0f}-%{R_STOP_MAKS_PCT * 100:.0f} arasi{RESET}")
-    print(f"{GRAY}  Kar alma           : 1/3 +{TP1_R:g}R (stop basa-basa), kalanin yarisi +{TP2_R:g}R "
-          f"(stop +{TP2_SONRASI_KILIT_R:g}R), son kisim zirve-{CHANDELIER_ATR_KATSAYI:g}xATR takip{RESET}")
-    print(f"{GRAY}  ADX trend filtresi : min {ADX_MIN_ESIK} (altinda whipsaw/yatay piyasa - GIRILMEZ){RESET}")
-    print(f"{GRAY}  ATR grid adaptasyonu: dusuk vol ~%2.75 / orta ~%4 / yuksek vol ~%5.25 basamak{RESET}")
-    print(f"{GRAY}  Zaman asimi cikisi : {MAKS_POZISYON_OMRU_SAAT:.0f}s+ ve kar<%{ZAMAN_ASIMI_KAR_ESIGI_PCT*100:.0f} ise zorla kapatilir{RESET}")
-    print(f"{GRAY}  Dinamik cooldown   : kar={COOLDOWN_KAR_DAKIKA:.0f}dk, zarar={COOLDOWN_ZARAR_DAKIKA:.0f}dk, zaman asimi={COOLDOWN_ZAMAN_ASIMI_DAKIKA:.0f}dk{RESET}")
+    if not TREND_MODU:  # v21: kisa vadeli stratejinin ayarlari
+        print(f"{GRAY}  Pozisyon modeli    : < {SNIPER_MODU_ESIGI_TRY:,.0f} TRY -> SNIPER MODU (kesinlikle 1 pozisyon),{RESET}")
+        print(f"{GRAY}                       {SNIPER_MODU_ESIGI_TRY:,.0f}-{KADEME_2_ESIGI_TRY:,.0f}:2 / "
+              f"{KADEME_2_ESIGI_TRY:,.0f}-{KADEME_3_ESIGI_TRY:,.0f}:3 / {KADEME_3_ESIGI_TRY:,.0f}-{KADEME_4_ESIGI_TRY:,.0f}:4 / "
+              f">={KADEME_4_ESIGI_TRY:,.0f}:{KASA_KAPASITESI_TAVAN} (tavan){RESET}")
+        print(f"{GRAY}                       taban pozisyon {TABAN_POZISYON_TUTARI:,.0f} TRY, "
+              f"BTC 24s gucune gore tam/yari/sifir kapasite{RESET}")
+        print(f"{GRAY}  Kalite onceligi    : ADX>={ADX_MIN_ESIK} VE RSI {RSI_KALITE_ALT_ESIK}-{RSI_KALITE_UST_ESIK} - "
+              f"bos slotta bile sadece en yuksek ADX'li aday alinir{RESET}")
+        print(f"{GRAY}  Cooldown           : {COOLDOWN_MINUTES} dk (satistan sonra yeniden alim kilidi){RESET}")
+        print(f"{GRAY}  Izleme listesi     : esnek, {MIN_WATCHLIST}-{MAX_WATCHLIST} coin arasi{RESET}")
+        print(f"{GRAY}  Firsat taramasi    : her ~{SCAN_INTERVAL_MINUTES} dk{RESET}")
+        print(f"{GRAY}  Varlik yenileme    : her ~{ASSET_REFRESH_HOURS} saat{RESET}")
+        print(f"{GRAY}  BTC dusus esigi    : %{BTC_DUSUS_ESIGI_PCT:.0f}{RESET}")
+        print(f"{GRAY}  Trend filtresi     : EMA{EMA_PERIYOT}, esik %{TREND_ESIK_PCT * 100:.1f}{RESET}")
+        print(f"{GRAY}  RSI giris filtresi : asiri alim>={RSI_ASIRI_ALIM_ESIGI} beklemeye alinir, "
+              f"giris icin RSI {RSI_KALITE_ALT_ESIK}-{RSI_KALITE_UST_ESIK}{RESET}")
+        print(f"{GRAY}  Detayli analiz     : gunluk/4s/1s/15dk trend, hacim, destek-direnc, USDT paritesi, "
+              f"BTC rejimi (min puan {ANALIZ_MIN_SKOR:.0f}){RESET}")
+        print(f"{GRAY}  Stop (1R)          : destegin alti veya {R_STOP_ATR_KATSAYI:g} x ATR(1s), "
+              f"%{R_STOP_MIN_PCT * 100:.0f}-%{R_STOP_MAKS_PCT * 100:.0f} arasi{RESET}")
+        print(f"{GRAY}  Kar alma           : 1/3 +{TP1_R:g}R (stop basa-basa), kalanin yarisi +{TP2_R:g}R "
+              f"(stop +{TP2_SONRASI_KILIT_R:g}R), son kisim zirve-{CHANDELIER_ATR_KATSAYI:g}xATR takip{RESET}")
+        print(f"{GRAY}  ADX trend filtresi : min {ADX_MIN_ESIK} (altinda whipsaw/yatay piyasa - GIRILMEZ){RESET}")
+        print(f"{GRAY}  ATR grid adaptasyonu: dusuk vol ~%2.75 / orta ~%4 / yuksek vol ~%5.25 basamak{RESET}")
+        print(f"{GRAY}  Zaman asimi cikisi : {MAKS_POZISYON_OMRU_SAAT:.0f}s+ ve kar<%{ZAMAN_ASIMI_KAR_ESIGI_PCT*100:.0f} ise zorla kapatilir{RESET}")
+        print(f"{GRAY}  Dinamik cooldown   : kar={COOLDOWN_KAR_DAKIKA:.0f}dk, zarar={COOLDOWN_ZARAR_DAKIKA:.0f}dk, zaman asimi={COOLDOWN_ZAMAN_ASIMI_DAKIKA:.0f}dk{RESET}")
     if CANLI_MOD:
         print(f"{GRAY}  Bakiye mutabakati  : her ~{MUTABAKAT_ARALIGI_SAAT:.0f} saatte + gunluk X raporunda{RESET}")
     print(f"{GRAY}  Acil fren limiti   : %{MAX_DRAWDOWN_PCT * 100:.0f} (portfoyun en yuksek degerinden; "
@@ -4502,13 +4609,14 @@ def print_banner():
     print(f"{GRAY}  Islem basina risk  : "
           f"{f'%{RISK_PCT * 100:g} (stop olursa portfoyun en fazla bu kadari gider)' if RISK_PCT > 0 else 'kapali (tum kasa)'}"
           f"{RESET}")
-    print(f"{GRAY}  Gunluk zarar limiti: "
-          f"{f'%{GUNLUK_ZARAR_LIMIT_PCT * 100:g} (asilirsa o gun yeni alim yok)' if GUNLUK_ZARAR_LIMIT_PCT > 0 else 'kapali'}"
-          f"{RESET}")
-    print(f"{GRAY}  Kayip korumasi     : "
-          + (f"art arda {KAYIP_SERISI_LIMIT} zarar -> {KAYIP_SERISI_MOLA_SAAT:.0f}s mola; " if KAYIP_SERISI_LIMIT else "")
-          + f"stop olan coin {COIN_STOP_ENGEL_SAAT:.0f}s, {COIN_TEKRAR_KAYIP_GUN} gunde {COIN_TEKRAR_KAYIP_SAYISI} "
-            f"zarar ettiren coin {COIN_TEKRAR_ENGEL_SAAT:.0f}s engelli{RESET}")
+    if not TREND_MODU:  # trend stratejisinde test edilen kurallar: sadece acil fren
+        print(f"{GRAY}  Gunluk zarar limiti: "
+              f"{f'%{GUNLUK_ZARAR_LIMIT_PCT * 100:g} (asilirsa o gun yeni alim yok)' if GUNLUK_ZARAR_LIMIT_PCT > 0 else 'kapali'}"
+              f"{RESET}")
+        print(f"{GRAY}  Kayip korumasi     : "
+              + (f"art arda {KAYIP_SERISI_LIMIT} zarar -> {KAYIP_SERISI_MOLA_SAAT:.0f}s mola; " if KAYIP_SERISI_LIMIT else "")
+              + f"stop olan coin {COIN_STOP_ENGEL_SAAT:.0f}s, {COIN_TEKRAR_KAYIP_GUN} gunde {COIN_TEKRAR_KAYIP_SAYISI} "
+                f"zarar ettiren coin {COIN_TEKRAR_ENGEL_SAAT:.0f}s engelli{RESET}")
     print(f"{GRAY}  Durum dosyasi      : {STATE_DOSYASI}{RESET}")
     print(f"{GRAY}  Telegram bildirimi : {'AKTIF (arka plan kuyrugu)' if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else 'kapali (TELEGRAM_BOT_TOKEN/CHAT_ID tanimli degil)'}{RESET}")
     telegram_hazir = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
@@ -4681,7 +4789,7 @@ def _yas_formatla(alis_zamani: Optional[datetime]) -> str:
 
 
 def print_performans_raporu(kasa: MerkeziKasa, pozisyonlar: dict, acik_pozisyon_sayisi: int,
-                             izin_verilen_pozisyon: Optional[int] = None):
+                             izin_verilen_pozisyon: Optional[int] = None, telegram_gonder: bool = True):
     """Baslangic/Guncel Bakiye, Net K/Z (TRY ve %), toplam komisyon, acik
     pozisyonlar (v14: hedef satis + stop fiyatlariyla birlikte) ve bekleyen
     K/Z durumlarini temiz bir tabloda basar; ek olarak ozet bir Telegram
@@ -4741,6 +4849,8 @@ def print_performans_raporu(kasa: MerkeziKasa, pozisyonlar: dict, acik_pozisyon_
     csv_portfoy_yaz(guncel_bakiye, kasa.baslangic, pnl, pnl_pct, acik_pozisyon_sayisi)
     print(f"{CYAN}{'=' * 70}{RESET}\n")
 
+    if not telegram_gonder:
+        return
     ozet_emoji = "\U0001F4C8" if pnl >= 0 else "\U0001F4C9"
     send_telegram(
         f"{ozet_emoji} <b>Performans Ozeti</b>\n"
@@ -4923,7 +5033,8 @@ def durum_ozeti_metni(kasa: "MerkeziKasa", pozisyonlar: dict) -> str:
         f"Baslangic: {kasa.baslangic:,.2f} TRY | toplam K/Z: {pnl:+,.2f} TRY"
         + (f" (%{pnl / kasa.baslangic * 100:+.1f})" if kasa.baslangic else ""),
         f"Yeni alimlar: {ALIM_DURUMU_ACIKLAMA.get(_alim_durumu, _alim_durumu)}",
-    ] + [html.escape(satir) for satir in _risk.durum_satirlari(portfoy)]
+    ] + ([html.escape(trend_durum_satiri())] if TREND_MODU else []) \
+      + [html.escape(satir) for satir in _risk.durum_satirlari(portfoy)]
     acik = [b for b in pozisyonlar.values() if b.has_open_position]
     if not acik:
         satirlar.append("Acik pozisyon yok.")
@@ -5171,7 +5282,7 @@ def _bat_degeri(deger: str) -> str:
 
 
 def baslatici_olustur() -> int:
-    """'python project_aurelius_bot_v20.py kurulum': bu penceredeki ayarlarla, bot
+    """'python project_aurelius_bot_v21.py kurulum': bu penceredeki ayarlarla, bot
     cokerse/koparsa 60 sn sonra kendini yeniden baslatan baslatici dosyayi olusturur
     ve (Windows'ta, istege bagli) oturum acilinca otomatik baslatir."""
     gerekli = ["BINANCE_TR_API_KEY", "BINANCE_TR_SECRET_KEY", "AURELIUS_LIVE_CONFIRM", "AURELIUS_CANLI_MOD"]
@@ -5259,7 +5370,7 @@ def _risk_baslat(kasa: "MerkeziKasa", portfoy: float, risk_kayitli: bool) -> Non
     if not risk_kayitli or _risk.yatirilan_sermaye <= 0:
         _risk.yatirilan_sermaye = portfoy if CANLI_MOD else (kasa.baslangic or portfoy)
         _risk.zirve_portfoy = portfoy
-        print(f"{CYAN}  v20 sermaye takibi basladi: {portfoy:,.2f} TRY (bundan sonra yeniden baslatmada "
+        print(f"{CYAN}  Sermaye takibi basladi: {portfoy:,.2f} TRY (bundan sonra yeniden baslatmada "
               f"sifirlanmaz).{RESET}")
     if BASLANGIC_SERMAYE_TRY > 0:
         _risk.yatirilan_sermaye = BASLANGIC_SERMAYE_TRY
@@ -5315,28 +5426,32 @@ def run_simulation():
         print(f"{RED}Bot baslatilamadi (CANLI_MOD guvenlik kontrolu basarisiz).{RESET}")
         return CIKIS_AYAR_HATASI
 
-    print(f"[{ts()}] Binance TR piyasasi taraniyor, TRY paritesi olan coinler bulunuyor...")
-    try:
-        semboller = try_paritelerini_bul()
-    except Exception as e:
-        print(f"{RED}Piyasa taranamadi: {e}{RESET}")
-        return CIKIS_YENIDEN_DENE
+    if TREND_MODU:
+        # v21: trend modunda tarama yok - sabit buyuk coin listesi, gunde bir kontrol
+        semboller, watchlist, hacim_map, durum_map, bilgi_map = list(TREND_COINLERI), [], {}, {}, {}
+    else:
+        print(f"[{ts()}] Binance TR piyasasi taraniyor, TRY paritesi olan coinler bulunuyor...")
+        try:
+            semboller = try_paritelerini_bul()
+        except Exception as e:
+            print(f"{RED}Piyasa taranamadi: {e}{RESET}")
+            return CIKIS_YENIDEN_DENE
 
-    if not semboller:
-        print(f"{RED}Hicbir TRY paritesi bulunamadi, bot baslatilamiyor.{RESET}")
-        return CIKIS_YENIDEN_DENE
+        if not semboller:
+            print(f"{RED}Hicbir TRY paritesi bulunamadi, bot baslatilamiyor.{RESET}")
+            return CIKIS_YENIDEN_DENE
 
-    print(f"[{ts()}] Toplam {len(semboller)} TRY paritesi bulundu.\n")
+        print(f"[{ts()}] Toplam {len(semboller)} TRY paritesi bulundu.\n")
 
-    try:
-        watchlist, hacim_map, durum_map, bilgi_map = coin_degerlendir_ve_sec(semboller, MAX_WATCHLIST)
-    except Exception as e:
-        print(f"{RED}Coin degerlendirmesi yapilamadi: {e}{RESET}")
-        return CIKIS_YENIDEN_DENE
+        try:
+            watchlist, hacim_map, durum_map, bilgi_map = coin_degerlendir_ve_sec(semboller, MAX_WATCHLIST)
+        except Exception as e:
+            print(f"{RED}Coin degerlendirmesi yapilamadi: {e}{RESET}")
+            return CIKIS_YENIDEN_DENE
 
-    if not watchlist:
-        print(f"{YELLOW}  Su an kriterlere uyan hicbir coin yok. Bot %100 nakitte bekleyecek "
-              f"ve periyodik olarak piyasayi yeniden tarayacak.{RESET}\n")
+        if not watchlist:
+            print(f"{YELLOW}  Su an kriterlere uyan hicbir coin yok. Bot %100 nakitte bekleyecek "
+                  f"ve periyodik olarak piyasayi yeniden tarayacak.{RESET}\n")
 
     # v10 BOLUM 1: onceki oturumdan kalici durum var mi kontrol et
     try:
@@ -5346,6 +5461,11 @@ def run_simulation():
         return CIKIS_AYAR_HATASI
     risk_kayitli = bool(kayitli_durum and isinstance(kayitli_durum.get("risk"), dict))  # v20
     _risk = RiskKorumasi.from_dict(kayitli_durum.get("risk") if kayitli_durum else None)
+    _trend_durumu.clear()
+    _trend_durumu.update((kayitli_durum or {}).get("trend") or {})  # v21
+    if kayitli_durum and kayitli_durum.get("strateji", "KISA") != STRATEJI:
+        print(f"{CYAN}  Strateji degisti ({kayitli_durum.get('strateji', 'KISA')} -> {STRATEJI}): acik pozisyonlar "
+              f"acildiklari kurallarla yonetilmeye devam eder, yeni alimlar {STRATEJI} kurallariyla yapilir.{RESET}")
     if kayitli_durum:
         kasa, pozisyonlar, acik_baslangic_sayisi = durumdan_kasa_ve_pozisyonlar_olustur(kayitli_durum)
         acik_pozisyon_sayaci = [acik_baslangic_sayisi]
@@ -5416,11 +5536,18 @@ def run_simulation():
         send_telegram(f"\U0001F7E2 <b>Project Aurelius CANLI MODDA baslatildi!</b>\nBorsa bakiyesi: {kasa.bakiye:,.2f} TRY"
                       f"\nYeni alimlar: {ALIM_DURUMU_ACIKLAMA[_alim_durumu]}"
                       f"\nBorsa stop emri: {'ACIK' if BORSA_STOP_AKTIF else 'kapali'}"
-                      f"\nIslem basina risk: %{RISK_PCT * 100:g} | gunluk zarar limiti: %{GUNLUK_ZARAR_LIMIT_PCT * 100:g}"
+                      f"\n{trend_durum_satiri() if TREND_MODU else 'Strateji: KISA (detayli analiz)'}"
+                      f"\nIslem basina risk: %{RISK_PCT * 100:g}"
+                      + ("" if TREND_MODU else f" | gunluk zarar limiti: %{GUNLUK_ZARAR_LIMIT_PCT * 100:g}")
                       + ("\nKomutlar icin /yardim" if TELEGRAM_KOMUTLARI_AKTIF else ""))
     else:
-        send_telegram(f"\U0001F9EA Project Aurelius SIMULASYON modunda baslatildi. Bakiye: {kasa.bakiye:,.2f} TRY")
+        send_telegram(f"\U0001F9EA Project Aurelius SIMULASYON modunda baslatildi. Bakiye: {kasa.bakiye:,.2f} TRY\n"
+                      + (trend_durum_satiri() if TREND_MODU else "Strateji: KISA (detayli analiz)"))
     _risk_baslat(kasa, v9_toplam_portfoy_degeri(kasa, pozisyonlar), risk_kayitli)  # v20
+    if TREND_MODU:
+        print(f"{CYAN}  {trend_durum_satiri()}{RESET}")
+        print(f"{GRAY}  Gunluk kontrol her gun TR saatiyle ~03:{TREND_KONTROL_GECIKME_DK:02d}'te (gunluk mum "
+              f"kapanisindan sonra); bot o saatte kapaliysa acilinca yapilir.{RESET}\n")
 
     def kaydet():
         durumu_kaydet(kasa, pozisyonlar, rapor)
@@ -5451,119 +5578,127 @@ def run_simulation():
     scan_araligi_tur = max(1, round((SCAN_INTERVAL_MINUTES * 60) / REAL_POLL_INTERVAL_SECONDS))
     varlik_yenileme_araligi_tur = max(1, round((ASSET_REFRESH_HOURS * 3600) / REAL_POLL_INTERVAL_SECONDS))
     mutabakat_araligi_tur = max(1, round((MUTABAKAT_ARALIGI_SAAT * 3600) / REAL_POLL_INTERVAL_SECONDS))  # v16
-    print(f"[{ts()}] Firsat taramasi her ~{SCAN_INTERVAL_MINUTES} dk'da bir, "
-          f"varlik listesi yenilemesi her ~{ASSET_REFRESH_HOURS} saatte bir yapilacak.\n")
+    if not TREND_MODU:
+        print(f"[{ts()}] Firsat taramasi her ~{SCAN_INTERVAL_MINUTES} dk'da bir, "
+              f"varlik listesi yenilemesi her ~{ASSET_REFRESH_HOURS} saatte bir yapilacak.\n")
 
     try:
         while True:
-            piyasa_sert_duste = False
-            btc_degisim = None
-            try:
-                piyasa_sert_duste, btc_degisim = btc_piyasa_durumu()
-                if piyasa_sert_duste:
-                    print(f"[{ts()}] {RED}BTC 24s degisim %{btc_degisim:.2f} - piyasa sert dususte, "
-                          f"YENI pozisyon aranmiyor (mevcut pozisyonlar yonetilmeye devam ediyor).{RESET}")
-            except Exception:
-                pass
-            # v19: detayli BTC rejimi (5 dk onbellekli). RISKLI -> yeni alim yok.
-            try:
-                btc_rejimi = btc_rejim_analizi().get("rejim", "BILINMIYOR")
-            except Exception:
-                btc_rejimi = "BILINMIYOR"
-            if btc_rejimi != son_btc_rejimi:
-                if son_btc_rejimi is not None:
-                    print(f"[{ts()}] {CYAN}BTC rejimi degisti: {son_btc_rejimi} -> {btc_rejimi}{RESET}")
-                    if btc_rejimi == "RISKLI" or son_btc_rejimi == "RISKLI":
-                        send_telegram(f"\u26A0\uFE0F <b>BTC rejimi: {son_btc_rejimi} -> {btc_rejimi}</b>\n"
-                                      + ("Yeni alim yapilmayacak; acik pozisyonlar yonetilmeye devam ediyor."
-                                         if btc_rejimi == "RISKLI" else "Yeni alimlar tekrar degerlendiriliyor."))
-                son_btc_rejimi = btc_rejimi
-            if btc_rejimi == "RISKLI":
-                piyasa_sert_duste = True
-
-            # Sayac tick icinde canli guncellenir, ama basarisiz tasfiye / mutabakat
-            # ile kapatilan pozisyonlar gibi yollarla kayabilir; her tick gercekten
-            # yeniden kur.
-            if komut_isleyici is not None:
-                komut_isleyici()
-            acik_pozisyon_sayaci[0] = sum(1 for b in pozisyonlar.values() if b.has_open_position)
-            guncel_bakiye = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
-            izin_verilen_pozisyon, hedef_pozisyon_tutari, sniper_modu_aktif = dinamik_pozisyon_planla(
-                kasa.bakiye, guncel_bakiye, btc_degisim, btc_rejimi
-            )  # v17: kasaya gore adaptif Sniper Modu / kademeli portfoy modeli; v19: BTC rejimi
-            if _alim_durumu != "ACIK":
-                izin_verilen_pozisyon = 0  # v18: /alimdurdur veya /bosalt - sadece yonetim, yeni alim yok
-            _risk.portfoy_guncelle(guncel_bakiye)  # v20: gunluk zarar limiti / kayip molasi
-            risk_engeli = _risk.yeni_alim_engeli(guncel_bakiye)
-            if risk_engeli:
-                izin_verilen_pozisyon = 0
-            son_risk_engeli = _risk_engeli_bildir(risk_engeli, son_risk_engeli)
-            en_kaliteli_aday = en_kaliteli_aday_belirle(bilgi_map, pozisyonlar)  # v17 MODUL 1.2
-
-            ilgilenilecek_semboller = sorted(set(pozisyonlar.keys()) | set(watchlist))
-
-            for sym in ilgilenilecek_semboller:
-                if sym not in pozisyonlar:
-                    dinamik_width = bilgi_map.get(sym, {}).get("width_pct", VARSAYILAN_WIDTH_PCT)  # v16
-                    pozisyonlar[sym] = CoinBot(
-                        symbol=sym,
-                        coin_name=_coin_adi(sym),
-                        width_pct=dinamik_width,
-                        grid_count=VARSAYILAN_GRID_SAYISI,
-                        starting_try=0.0,
-                        tek_pozisyon_modu=True,
-                        bekliyor=(durum_map.get(sym) == "BEKLEMEDE"),
-                    )
-                bot = pozisyonlar[sym]
-
+            if TREND_MODU:
+                if komut_isleyici is not None:
+                    komut_isleyici()
+                acik_pozisyon_sayaci[0] = sum(1 for b in pozisyonlar.values() if b.has_open_position)
+                izin_verilen_pozisyon = TREND_MAKS_POZISYON
+                _trend_turu(kasa, pozisyonlar, acik_pozisyon_sayaci, kaydet, rapor)
+            else:
+                piyasa_sert_duste = False
+                btc_degisim = None
                 try:
-                    fiyat = get_last_price(sym)
-                except Exception as e:
-                    print(f"[{ts()}] {MAGENTA}{sym:<9}{RESET} {RED}gercek fiyat alinamadi: {e}{RESET}")
-                    continue
-                bot.last_real_price = fiyat
-                bot.bu_turda_islem_yapildi = False
+                    piyasa_sert_duste, btc_degisim = btc_piyasa_durumu()
+                    if piyasa_sert_duste:
+                        print(f"[{ts()}] {RED}BTC 24s degisim %{btc_degisim:.2f} - piyasa sert dususte, "
+                              f"YENI pozisyon aranmiyor (mevcut pozisyonlar yonetilmeye devam ediyor).{RESET}")
+                except Exception:
+                    pass
+                # v19: detayli BTC rejimi (5 dk onbellekli). RISKLI -> yeni alim yok.
+                try:
+                    btc_rejimi = btc_rejim_analizi().get("rejim", "BILINMIYOR")
+                except Exception:
+                    btc_rejimi = "BILINMIYOR"
+                if btc_rejimi != son_btc_rejimi:
+                    if son_btc_rejimi is not None:
+                        print(f"[{ts()}] {CYAN}BTC rejimi degisti: {son_btc_rejimi} -> {btc_rejimi}{RESET}")
+                        if btc_rejimi == "RISKLI" or son_btc_rejimi == "RISKLI":
+                            send_telegram(f"\u26A0\uFE0F <b>BTC rejimi: {son_btc_rejimi} -> {btc_rejimi}</b>\n"
+                                          + ("Yeni alim yapilmayacak; acik pozisyonlar yonetilmeye devam ediyor."
+                                             if btc_rejimi == "RISKLI" else "Yeni alimlar tekrar degerlendiriliyor."))
+                    son_btc_rejimi = btc_rejimi
+                if btc_rejimi == "RISKLI":
+                    piyasa_sert_duste = True
 
-                if bot.bekliyor:
-                    bot.bekleme_sayaci += 1
-                    if bot.bekleme_sayaci % RSI_BEKLEME_KONTROL_ARALIGI_TUR == 0:
-                        try:
-                            durum, _, rsi14, _, _, _ = trend_ve_rsi_durumu(sym)
-                        except Exception:
-                            durum, rsi14 = "BEKLEMEDE", None
-                        rsi_str = f"{rsi14:.1f}" if rsi14 is not None else "N/A"
-                        if durum == "HAZIR":
-                            print(f"[{ts()}] {MAGENTA}{sym:<9}{RESET} {GREEN}RSI sogudu (RSI={rsi_str}) - degerlendirmeye alindi.{RESET}")
-                            bot.bekliyor = False
-                        else:
-                            print(f"[{ts()}] {MAGENTA}{sym:<9}{RESET} {YELLOW}hala beklemede (RSI={rsi_str}).{RESET}")
+                # Sayac tick icinde canli guncellenir, ama basarisiz tasfiye / mutabakat
+                # ile kapatilan pozisyonlar gibi yollarla kayabilir; her tick gercekten
+                # yeniden kur.
+                if komut_isleyici is not None:
+                    komut_isleyici()
+                acik_pozisyon_sayaci[0] = sum(1 for b in pozisyonlar.values() if b.has_open_position)
+                guncel_bakiye = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
+                izin_verilen_pozisyon, hedef_pozisyon_tutari, sniper_modu_aktif = dinamik_pozisyon_planla(
+                    kasa.bakiye, guncel_bakiye, btc_degisim, btc_rejimi
+                )  # v17: kasaya gore adaptif Sniper Modu / kademeli portfoy modeli; v19: BTC rejimi
+                if _alim_durumu != "ACIK":
+                    izin_verilen_pozisyon = 0  # v18: /alimdurdur veya /bosalt - sadece yonetim, yeni alim yok
+                _risk.portfoy_guncelle(guncel_bakiye)  # v20: gunluk zarar limiti / kayip molasi
+                risk_engeli = _risk.yeni_alim_engeli(guncel_bakiye)
+                if risk_engeli:
+                    izin_verilen_pozisyon = 0
+                son_risk_engeli = _risk_engeli_bildir(risk_engeli, son_risk_engeli)
+                en_kaliteli_aday = en_kaliteli_aday_belirle(bilgi_map, pozisyonlar)  # v17 MODUL 1.2
+
+                ilgilenilecek_semboller = sorted(set(pozisyonlar.keys()) | set(watchlist))
+
+                for sym in ilgilenilecek_semboller:
+                    if sym not in pozisyonlar:
+                        dinamik_width = bilgi_map.get(sym, {}).get("width_pct", VARSAYILAN_WIDTH_PCT)  # v16
+                        pozisyonlar[sym] = CoinBot(
+                            symbol=sym,
+                            coin_name=_coin_adi(sym),
+                            width_pct=dinamik_width,
+                            grid_count=VARSAYILAN_GRID_SAYISI,
+                            starting_try=0.0,
+                            tek_pozisyon_modu=True,
+                            bekliyor=(durum_map.get(sym) == "BEKLEMEDE"),
+                        )
+                    bot = pozisyonlar[sym]
+
+                    try:
+                        fiyat = get_last_price(sym)
+                    except Exception as e:
+                        print(f"[{ts()}] {MAGENTA}{sym:<9}{RESET} {RED}gercek fiyat alinamadi: {e}{RESET}")
+                        continue
+                    bot.last_real_price = fiyat
+                    bot.bu_turda_islem_yapildi = False
+
+                    if bot.bekliyor:
+                        bot.bekleme_sayaci += 1
+                        if bot.bekleme_sayaci % RSI_BEKLEME_KONTROL_ARALIGI_TUR == 0:
+                            try:
+                                durum, _, rsi14, _, _, _ = trend_ve_rsi_durumu(sym)
+                            except Exception:
+                                durum, rsi14 = "BEKLEMEDE", None
+                            rsi_str = f"{rsi14:.1f}" if rsi14 is not None else "N/A"
+                            if durum == "HAZIR":
+                                print(f"[{ts()}] {MAGENTA}{sym:<9}{RESET} {GREEN}RSI sogudu (RSI={rsi_str}) - degerlendirmeye alindi.{RESET}")
+                                bot.bekliyor = False
+                            else:
+                                print(f"[{ts()}] {MAGENTA}{sym:<9}{RESET} {YELLOW}hala beklemede (RSI={rsi_str}).{RESET}")
+                        time.sleep(API_CALL_SLEEP_SECONDS)
+                        continue
+
+                    if not bot.initialized:
+                        bot.setup_grid(fiyat)
+                    elif not bot.has_open_position and (fiyat < bot.lower or fiyat > bot.upper):
+                        # Grid yalnizca ilk fiyatta kuruluyordu; fiyat bu banttan
+                        # ciktiginda evaluate_v9 yeni alimi engelledigi icin coin, izleme
+                        # listesinde kaldigi surece KALICI olarak alinamaz hale geliyordu.
+                        # Pozisyon yokken grid'i guncel fiyata (ve guncel ATR genisligine)
+                        # yeniden ortala.
+                        bot.width_pct = bilgi_map.get(sym, {}).get("width_pct", bot.width_pct)
+                        bot.setup_grid(fiyat)
+
+                    if piyasa_sert_duste:
+                        bot.stop_loss_kontrol(fiyat, sim=False, kasa=kasa, acik_pozisyon_sayaci=acik_pozisyon_sayaci,
+                                               durum_kaydet=kaydet, rapor=rapor)
+                    else:
+                        bot.evaluate_v9(fiyat, sim=False, kasa=kasa, acik_pozisyon_sayaci=acik_pozisyon_sayaci,
+                                         hedef_pozisyon_tutari=hedef_pozisyon_tutari,
+                                         izin_verilen_pozisyon=izin_verilen_pozisyon,
+                                         durum_kaydet=kaydet, rapor=rapor, giris_bilgisi=bilgi_map.get(sym),
+                                         en_kaliteli_aday=en_kaliteli_aday, sniper_modu=sniper_modu_aktif,
+                                         portfoy_degeri=guncel_bakiye)
+                    bot.borsa_stop_bakimi(kasa, acik_pozisyon_sayaci, rapor, kaydet)  # v18
+
                     time.sleep(API_CALL_SLEEP_SECONDS)
-                    continue
-
-                if not bot.initialized:
-                    bot.setup_grid(fiyat)
-                elif not bot.has_open_position and (fiyat < bot.lower or fiyat > bot.upper):
-                    # Grid yalnizca ilk fiyatta kuruluyordu; fiyat bu banttan
-                    # ciktiginda evaluate_v9 yeni alimi engelledigi icin coin, izleme
-                    # listesinde kaldigi surece KALICI olarak alinamaz hale geliyordu.
-                    # Pozisyon yokken grid'i guncel fiyata (ve guncel ATR genisligine)
-                    # yeniden ortala.
-                    bot.width_pct = bilgi_map.get(sym, {}).get("width_pct", bot.width_pct)
-                    bot.setup_grid(fiyat)
-
-                if piyasa_sert_duste:
-                    bot.stop_loss_kontrol(fiyat, sim=False, kasa=kasa, acik_pozisyon_sayaci=acik_pozisyon_sayaci,
-                                           durum_kaydet=kaydet, rapor=rapor)
-                else:
-                    bot.evaluate_v9(fiyat, sim=False, kasa=kasa, acik_pozisyon_sayaci=acik_pozisyon_sayaci,
-                                     hedef_pozisyon_tutari=hedef_pozisyon_tutari,
-                                     izin_verilen_pozisyon=izin_verilen_pozisyon,
-                                     durum_kaydet=kaydet, rapor=rapor, giris_bilgisi=bilgi_map.get(sym),
-                                     en_kaliteli_aday=en_kaliteli_aday, sniper_modu=sniper_modu_aktif,
-                                     portfoy_degeri=guncel_bakiye)
-                bot.borsa_stop_bakimi(kasa, acik_pozisyon_sayaci, rapor, kaydet)  # v18
-
-                time.sleep(API_CALL_SLEEP_SECONDS)
 
             real_poll_count += 1
             rapor.drawdown_guncelle(v9_toplam_portfoy_degeri(kasa, pozisyonlar))  # v11: Z donemi max drawdown takibi
@@ -5595,7 +5730,7 @@ def run_simulation():
                       f"portfoy degerinden baslar.{RESET}")
                 return CIKIS_DUR
 
-            if real_poll_count % scan_araligi_tur == 0:
+            if not TREND_MODU and real_poll_count % scan_araligi_tur == 0:
                 _risk.temizle()  # v20: suresi dolan coin engelleri
                 try:
                     hedef_sayi = MIN_WATCHLIST if piyasa_sert_duste else MAX_WATCHLIST
@@ -5603,7 +5738,7 @@ def run_simulation():
                 except Exception as e:
                     print(f"{RED}Firsat taramasi basarisiz, mevcut watchlist ile devam ediliyor: {e}{RESET}")
 
-            if real_poll_count % varlik_yenileme_araligi_tur == 0:
+            if not TREND_MODU and real_poll_count % varlik_yenileme_araligi_tur == 0:
                 print(f"\n{CYAN}{BOLD}{'*' * 74}{RESET}")
                 print(f"{CYAN}{BOLD}  OTONOM VARLIK YENILEME - {ts()}{RESET}")
                 print(f"{CYAN}{BOLD}{'*' * 74}{RESET}")
@@ -5621,8 +5756,9 @@ def run_simulation():
                 print(f"{CYAN}{BOLD}{'*' * 74}{RESET}\n")
 
             if real_poll_count % SUMMARY_EVERY_N_REAL_POLLS == 0:
+                # v21: sadece konsola; Telegram ozeti AURELIUS_DURUM_BILDIRIM_SAAT'te bir gider
                 print_performans_raporu(kasa, pozisyonlar, acik_pozisyon_sayaci[0],
-                                         izin_verilen_pozisyon=izin_verilen_pozisyon)
+                                         izin_verilen_pozisyon=izin_verilen_pozisyon, telegram_gonder=False)
 
             # v16 BOLUM 4: CANLI MOD bakiye mutabakati - periyodik (her ~6 saat)
             if real_poll_count % mutabakat_araligi_tur == 0:
@@ -5656,7 +5792,7 @@ def run_simulation():
                 return CIKIS_DUR
 
             # CANLI modda asla simule fiyatla islem yapilmaz (GERCEKCI_MOD kapatilsa bile)
-            if GERCEKCI_MOD or CANLI_MOD:
+            if GERCEKCI_MOD or CANLI_MOD or TREND_MODU:
                 _dongu_beklemesi(komut_isleyici)
             else:
                 for _ in range(SUB_TICKS_PER_REAL_POLL):
@@ -6083,7 +6219,7 @@ def backtest_komutu(argumanlar: list) -> int:
     (60 gun once biten 60 gunluk donem) veya 'backtest 60 1000 PEPETRY,SOLTRY'."""
     gun, sermaye, semboller, geri = _backtest_argumanlari(argumanlar)
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v20 - GECMIS VERI TESTI'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v21 - GECMIS VERI TESTI'.center(74)}{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
     bitis_ms = (int(time.time() * 1000) // ARALIK_MS["1h"] * ARALIK_MS["1h"]) - geri * ARALIK_MS["1d"]
     bas_ms = bitis_ms - gun * ARALIK_MS["1d"]
@@ -6128,7 +6264,7 @@ def karsilastir_komutu(argumanlar: list) -> int:
     global ANALIZ_MIN_SKOR
     gun, sermaye, semboller, _ = _backtest_argumanlari(argumanlar)
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v20 - PUAN BARAJI KARSILASTIRMASI'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v21 - PUAN BARAJI KARSILASTIRMASI'.center(74)}{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
     son_ms = int(time.time() * 1000) // ARALIK_MS["1h"] * ARALIK_MS["1h"]
     orta_ms = son_ms - gun * ARALIK_MS["1d"]
@@ -6271,7 +6407,7 @@ def strateji_komutu(argumanlar: list) -> int:
     varsayilan 60 -> son 180 gun) ayni veriyle karsilastirir."""
     gun, sermaye, semboller, _ = _backtest_argumanlari(argumanlar)
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v20 - STRATEJI KARSILASTIRMASI'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v21 - STRATEJI KARSILASTIRMASI'.center(74)}{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
     son_ms = int(time.time() * 1000) // ARALIK_MS["1h"] * ARALIK_MS["1h"]
     sinirlar = [son_ms - k * gun * ARALIK_MS["1d"] for k in (3, 2, 1, 0)]
@@ -6342,6 +6478,17 @@ def _atr_serisi(yuksek: list, dusuk: list, kapanis: list, periyot: int) -> list:
             atr = (atr * (periyot - 1) + tr) / periyot
         sonuc[i] = atr
     return sonuc
+
+
+def trend_sinyali(v: dict, i: int, kirilim: int, ema: list, atr: list) -> Optional[tuple]:
+    """i. gunun kapanisinda kirilim sinyali (test ve canli ayni kural): kapanis onceki 'kirilim' gunun en
+    yuksegini asti ve EMA50 ustunde. Donus: (60 gunluk getiri - siralama icin, kapanis, ATR) veya None."""
+    if i < kirilim or i >= len(v["kapanis"]):
+        return None
+    a, e, kap = atr[i], ema[i], v["kapanis"][i]
+    if a and e and kap > e and kap > max(v["yuksek"][i - kirilim:i]):
+        return kap / v["kapanis"][max(0, i - 60)] - 1, kap, a
+    return None
 
 
 def trend_simule_et(coin_gunluk: dict, btc_gunluk: Optional[dict], bas_ms: int, bitis_ms: int, sermaye: float,
@@ -6419,10 +6566,9 @@ def trend_simule_et(coin_gunluk: dict, btc_gunluk: Optional[dict], bas_ms: int, 
                 i = h["idx"].get(t)
                 if s in acik or i is None or i < kirilim:
                     continue
-                v, atr, ema = h["v"], h["atr"][i], h["ema"][i]
-                kap = v["kapanis"][i]
-                if atr and ema and kap > ema and kap > max(v["yuksek"][i - kirilim:i]):
-                    adaylar.append((kap / v["kapanis"][max(0, i - 60)] - 1, s, kap, atr))
+                sinyal = trend_sinyali(h["v"], i, kirilim, h["ema"], h["atr"])
+                if sinyal:
+                    adaylar.append((sinyal[0], s, sinyal[1], sinyal[2]))
             for _, s, kap, atr in sorted(adaylar, reverse=True)[:bos]:
                 giris = kap * (1 + BACKTEST_SLIPAJ_PCT)
                 stop = giris - TREND_ILK_STOP_ATR * atr
@@ -6445,6 +6591,173 @@ def trend_simule_et(coin_gunluk: dict, btc_gunluk: Optional[dict], bas_ms: int, 
             "sayac": sayac}
 
 
+# ==========================================================================
+# v21: GUNLUK TREND TAKIBI - CANLI / SIMULASYON CALISMA (AURELIUS_STRATEJI=TREND, varsayilan)
+# Gunluk mum kapanisindan (00:00 UTC = TR 03:00) sonra GUNDE BIR KEZ: acik trend pozisyonlarinin stop'u
+# yukseltilir, sinyal veren coinlere (en fazla TREND_MAKS_POZISYON) islem basina RISK_PCT riskle girilir.
+# Gun icinde her turda sadece stop kontrol edilir. Kurallar 'trend' testindekiyle ayni (trend_sinyali).
+# ==========================================================================
+def _gunluk_mumlar(sembol: str, bugun_ms: int, gun: int) -> Optional[dict]:
+    """Bugune kadar KAPANMIS son 'gun' gunluk mum; son mum dun kapanmis olmali (yoksa None)."""
+    v = gecmis_mumlari_getir(sembol, "1d", bugun_ms - gun * ARALIK_MS["1d"], bugun_ms)
+    if not v or v["zaman"][-1] != bugun_ms - ARALIK_MS["1d"]:
+        return None
+    return v
+
+
+def trend_gunluk_kontrol(kasa: "MerkeziKasa", pozisyonlar: dict, acik_pozisyon_sayaci: list,
+                         durum_kaydet, rapor, simdi_ms: Optional[int] = None) -> bool:
+    """Gunluk kontrolu (gunde bir kez) yapar. Yapildiysa True; zamani gelmediyse/veri yoksa False
+    (sonraki turda tekrar denenir)."""
+    gun_ms = ARALIK_MS["1d"]
+    simdi_ms = simdi_ms or int(time.time() * 1000)
+    bugun = simdi_ms // gun_ms * gun_ms
+    if _trend_durumu.get("son_gun") == bugun or simdi_ms - bugun < TREND_KONTROL_GECIKME_DK * 60_000:
+        return False
+    gerekli = TREND_GUNLUK_MUM  # ATR/EMA testteki gibi uzun gecmisle hesaplansin
+    acik_trend = [s for s, b in pozisyonlar.items()
+                  if b.has_open_position and any(l.has_position and l.trend_stop > 0 for l in b.grid)]
+    gunluk = {}
+    for s in dict.fromkeys(list(TREND_COINLERI) + acik_trend):
+        try:
+            v = _gunluk_mumlar(s, bugun, gerekli)
+        except Exception as e:
+            logger.warning("Trend: %s gunluk mumlari alinamadi: %s", s, e)
+            continue
+        if v:
+            gunluk[s] = v
+        time.sleep(API_CALL_SLEEP_SECONDS)
+    if not gunluk:
+        print(f"[{ts()}] {YELLOW}Trend kontrolu: gunluk mumlar alinamadi, sonraki turda tekrar denenecek.{RESET}")
+        return False
+    btc_yukari = None
+    try:
+        btc = _gunluk_mumlar("BTCUSDT", bugun, gerekli) or gunluk.get("BTCTRY")
+        if btc:
+            ema_btc = _ema_hizali(btc["kapanis"], TREND_EMA)[-1]
+            btc_yukari = ema_btc is not None and btc["kapanis"][-1] > ema_btc
+    except Exception as e:
+        logger.warning("Trend: BTC gunluk verisi alinamadi: %s", e)
+    satirlar = []
+
+    # 1) acik trend pozisyonlarinin stop'unu yukselt (zirve - 3 x ATR; asla asagi inmez)
+    for s in acik_trend:
+        v, bot = gunluk.get(s), pozisyonlar[s]
+        if not v:
+            continue
+        atr = _atr_serisi(v["yuksek"], v["dusuk"], v["kapanis"], TREND_ATR_PERIYOT)[-1]
+        giris_ms = bot.alis_zamani.timestamp() * 1000 if bot.alis_zamani else 0
+        for lvl in bot.grid:
+            if not (lvl.has_position and lvl.trend_stop > 0):
+                continue
+            lvl.en_yuksek_fiyat = max([lvl.en_yuksek_fiyat] + [y for z, y in zip(v["zaman"], v["yuksek"])
+                                                               if z + gun_ms > giris_ms])
+            eski = lvl.trend_stop
+            if atr:
+                lvl.trend_stop = max(lvl.trend_stop, lvl.en_yuksek_fiyat - TREND_TAKIP_ATR * atr)
+            fiyat = bot.guncel_fiyat()
+            satirlar.append(f"{s}: stop {format_fiyat(lvl.trend_stop)}"
+                            + (" (yukseltildi)" if lvl.trend_stop > eski else "")
+                            + (f", su an %{(fiyat / lvl.buy_price - 1) * 100:+.1f}" if fiyat and lvl.buy_price else ""))
+
+    # 2) yeni girisler
+    acik_sayi = sum(1 for b in pozisyonlar.values() if b.has_open_position)
+    bos = TREND_MAKS_POZISYON - acik_sayi
+    engel = None
+    if _alim_durumu != "ACIK":
+        engel = f"yeni alimlar {ALIM_DURUMU_ACIKLAMA.get(_alim_durumu, _alim_durumu)}"
+    elif _risk.fren_beklemede:
+        engel = "acil fren beklemede (/frensifirla)"
+    elif TREND_BTC_FILTRESI and not btc_yukari:
+        engel = "BTC gunluk trendi asagi (EMA50 altinda)" if btc_yukari is False else "BTC verisi alinamadi"
+    elif bos <= 0:
+        engel = f"pozisyon siniri dolu ({TREND_MAKS_POZISYON})"
+    alinanlar = []
+    if not engel:
+        adaylar = []
+        for s, v in gunluk.items():
+            if s not in TREND_COINLERI or (s in pozisyonlar and pozisyonlar[s].has_open_position):
+                continue
+            sinyal = trend_sinyali(v, len(v["kapanis"]) - 1, TREND_KIRILIM_GUN, _ema_hizali(v["kapanis"], TREND_EMA),
+                                   _atr_serisi(v["yuksek"], v["dusuk"], v["kapanis"], TREND_ATR_PERIYOT))
+            if sinyal:
+                adaylar.append((sinyal[0], s, sinyal[1], sinyal[2]))
+        portfoy = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
+        for _, s, kapanis, atr in sorted(adaylar, reverse=True)[:bos]:
+            try:
+                fiyat = get_last_price(s)
+            except Exception as e:
+                satirlar.append(f"{s}: sinyal var ama fiyat alinamadi ({e})")
+                continue
+            if fiyat > kapanis + TREND_KOVALAMA_ATR * atr:
+                satirlar.append(f"{s}: sinyal var ama fiyat kapanistan cok uzaklasti, kovalanmadi")
+                continue
+            spread_pct, _, _ = orderbook_spread_kontrol(s)
+            if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
+                satirlar.append(f"{s}: sinyal var ama spread genis (%{spread_pct:.2f}), alinmadi")
+                continue
+            stop_pct = TREND_ILK_STOP_ATR * atr / fiyat
+            if not (0 < stop_pct < 0.5):
+                continue
+            risk_tutari = portfoy * RISK_PCT / stop_pct if RISK_PCT > 0 else portfoy
+            tutar = min(risk_tutari, portfoy / TREND_MAKS_POZISYON, kasa.bakiye / (1 + KOMISYON_PCT))
+            if tutar < MIN_POZISYON_TUTARI_TRY:
+                satirlar.append(f"{s}: sinyal var ama ayrilabilecek tutar cok kucuk ({tutar:,.2f} TRY)")
+                continue
+            bot = pozisyonlar.get(s)
+            if bot is None:
+                bot = pozisyonlar[s] = CoinBot(symbol=s, coin_name=_coin_adi(s), width_pct=VARSAYILAN_WIDTH_PCT,
+                                               grid_count=VARSAYILAN_GRID_SAYISI, starting_try=0.0)
+            if bot.trend_girisi(fiyat, tutar, stop_pct, kasa, acik_pozisyon_sayaci, rapor, durum_kaydet,
+                                portfoy, btc_yukari):
+                alinanlar.append(s)
+        if not adaylar:
+            satirlar.append(f"Yeni sinyal yok ({TREND_KIRILIM_GUN} gunluk zirveyi kiran coin yok).")
+    _trend_durumu["son_gun"] = bugun
+    _trend_durumu["son_kontrol"] = datetime.now().isoformat(timespec="minutes")
+    _trend_durumu["btc_yukari"] = btc_yukari
+    durum_kaydet()
+    baslik = (f"BTC: {'yukselis trendinde (EMA50 ustu)' if btc_yukari else 'EMA50 altinda' if btc_yukari is False else 'bilinmiyor'}"
+              + (f" | yeni alim yok: {engel}" if engel else "")
+              + (f" | alinan: {', '.join(alinanlar)}" if alinanlar else ""))
+    print(f"[{ts()}] {CYAN}GUNLUK TREND KONTROLU - {baslik}{RESET}")
+    for satir in satirlar:
+        print(f"    {satir}")
+    send_telegram("\U0001F4C5 <b>Gunluk trend kontrolu</b>\n" + html.escape(baslik)
+                  + "".join(f"\n- {html.escape(x)}" for x in satirlar))
+    return True
+
+
+def _trend_turu(kasa: "MerkeziKasa", pozisyonlar: dict, acik_pozisyon_sayaci: list, kaydet, rapor) -> None:
+    """Trend modunda bir tur: gerekiyorsa gunluk kontrol, sonra acik pozisyonlarin stop kontrolu."""
+    try:
+        trend_gunluk_kontrol(kasa, pozisyonlar, acik_pozisyon_sayaci, kaydet, rapor)
+    except Exception as e:
+        print(f"[{ts()}] {RED}Gunluk trend kontrolu yapilamadi (sonraki turda tekrar): {e}{RESET}")
+        logger.error("Gunluk trend kontrolu hatasi: %s", e)
+    for sym, bot in list(pozisyonlar.items()):
+        if not bot.has_open_position:
+            continue
+        try:
+            fiyat = get_last_price(sym)
+        except Exception as e:
+            print(f"[{ts()}] {MAGENTA}{sym:<9}{RESET} {RED}gercek fiyat alinamadi: {e}{RESET}")
+            continue
+        bot.last_real_price = fiyat
+        bot.stop_loss_kontrol(fiyat, sim=False, kasa=kasa, acik_pozisyon_sayaci=acik_pozisyon_sayaci,
+                              durum_kaydet=kaydet, rapor=rapor)
+        bot.borsa_stop_bakimi(kasa, acik_pozisyon_sayaci, rapor, kaydet)
+        time.sleep(API_CALL_SLEEP_SECONDS)
+
+
+def trend_durum_satiri() -> str:
+    btc = _trend_durumu.get("btc_yukari")
+    return (f"Strateji: TREND ({TREND_KIRILIM_GUN} gun kirilim"
+            + (", BTC filtresi" if TREND_BTC_FILTRESI else "") + f", en fazla {TREND_MAKS_POZISYON} pozisyon)"
+            + f" | son gunluk kontrol: {(_trend_durumu.get('son_kontrol') or 'henuz yok').replace('T', ' ')}"
+            + (f" | BTC {'yukari' if btc else 'asagi'}" if btc is not None else ""))
+
+
 def trend_kiyasi(coin_gunluk: dict, bas_ms: int, bitis_ms: int) -> str:
     """Ayni donemde al-tut: BTC ve tum coinler esit agirlikli."""
     btc = _donem_degisimi(coin_gunluk.get("BTCTRY"), bas_ms, bitis_ms)
@@ -6465,7 +6778,7 @@ def trend_komutu(argumanlar: list) -> int:
     donem_gun = int(_aralikta(sayilar[0], 60, 365)) if sayilar else 180
     sermaye = sayilar[1] if len(sayilar) > 1 and sayilar[1] > 0 else BACKTEST_VARSAYILAN_SERMAYE
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
-    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v20 - GUNLUK TREND TAKIBI TESTI'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v21 - GUNLUK TREND TAKIBI TESTI'.center(74)}{RESET}")
     print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
     gun_ms = ARALIK_MS["1d"]
     son_ms = int(time.time() * 1000) // gun_ms * gun_ms
@@ -6535,7 +6848,7 @@ def rapor_komutu() -> int:
 
 
 def analiz_komutu(sembol: Optional[str]) -> int:
-    """'python project_aurelius_bot_v20.py analiz [SEMBOL]': botun bir coini nasil
+    """'python project_aurelius_bot_v21.py analiz [SEMBOL]': botun bir coini nasil
     degerlendirdigini gosterir (emir gondermez, anahtar gerektirmez)."""
     print(f"{BOLD}DETAYLI ANALIZ{RESET}")
     btc = btc_rejim_analizi(zorla=True)
