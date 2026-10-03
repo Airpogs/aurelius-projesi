@@ -25,6 +25,8 @@ v20 - RISK KORUMASI, ISLEM GUNLUGU VE GECMIS VERI TESTI:
      'karsilastir [GUN]' puan barajlarini (55-75) iki ardisik donemde yan yana karsilastirir.
      'strateji [GUN]' farkli kurallari (asiri oynak coinleri atlamak, genis stop, ek filtreler) uc
      ardisik donemde karsilastirir.
+     'trend [DONEM_GUN]' farkli bir strateji turunu test eder: buyuk coinlerde gunluk kirilimla
+     giris, genis ATR stop ve takip eden stop (4 x 180 gun = son 2 yil).
 v19 - DETAYLI ANALIZ VE R TABANLI KAR ALMA:
   GIRIS: Bot bir coine girmeden once onu gunluk, 4 saatlik, 1 saatlik ve 15
   dakikalik mumlarla (her birinde ~200 kapanmis mum) inceler:
@@ -511,6 +513,7 @@ Kullanim:
     python project_aurelius_bot_v20.py rapor                    (islem gunlugu ozeti)
     python project_aurelius_bot_v20.py karsilastir [GUN]        (puan barajlarini iki donemde karsilastirir)
     python project_aurelius_bot_v20.py strateji [GUN]           (farkli kurallari uc donemde karsilastirir)
+    python project_aurelius_bot_v20.py trend [DONEM_GUN]        (gunluk trend takibini 4 donemde test eder)
 """
 
 import time
@@ -6239,15 +6242,16 @@ def _sonuc_hucresi(s: dict) -> tuple:
     return len(isl), _ortalama(rler), s["bitis"] - s["baslangic"]
 
 
-def strateji_satirlari(sonuclar: dict, donemler: list, coin_verileri: dict, btc_verisi: Optional[dict]) -> list:
-    satirlar = [f"{ad} ({_tarih(b)} - {_tarih(e)}): " + _piyasa_kiyasi(coin_verileri, btc_verisi, b, e)
-                for ad, b, e in donemler]
+def strateji_satirlari(sonuclar: dict, donemler: list, coin_verileri: dict, btc_verisi: Optional[dict],
+                       varyant_adlari: Optional[list] = None, kiyas=None) -> list:
+    kiyas = kiyas or (lambda b, e: _piyasa_kiyasi(coin_verileri, btc_verisi, b, e))
+    satirlar = [f"{ad} ({_tarih(b)} - {_tarih(e)}): " + kiyas(b, e) for ad, b, e in donemler]
     satirlar.append("")
     genislik = 36
     satirlar.append(f"{'Strateji':<{genislik}}| " + " | ".join(f"{ad:<22}" for ad, _, _ in donemler) + " | TOPLAM")
     satirlar.append(f"{'':<{genislik}}| " + " | ".join(f"{'islem R/islem  net TL':<22}" for _ in donemler)
                     + " | R/islem  net TL")
-    for ad, _, _ in STRATEJI_VARYANTLARI:
+    for ad in (varyant_adlari or [v[0] for v in STRATEJI_VARYANTLARI]):
         hucreler, toplam_islem, toplam_r, toplam_tl, hep_arti = [], 0, 0.0, 0.0, True
         for donem_adi, _, _ in donemler:
             n, r, tl = _sonuc_hucresi(sonuclar[(ad, donem_adi)])
@@ -6297,6 +6301,227 @@ def strateji_komutu(argumanlar: list) -> int:
     return CIKIS_DUR
 
 
+# ==========================================================================
+# v20 BOLUM 4: GUNLUK TREND TAKIBI (test). Az sayida buyuk coin; gunluk kapanis son N gunun zirvesini
+# kirinca ve fiyat EMA50 ustundeyken girilir; stop 2 x ATR, fiyat yukseldikce zirve - 3 x ATR'ye cekilir.
+# Kismi kar alma yok (kazananlar kosar), islem az oldugu icin komisyon/kayma payi kucuk.
+# ==========================================================================
+TREND_COINLERI = ("BTCTRY", "ETHTRY", "BNBTRY", "SOLTRY", "XRPTRY", "ADATRY", "AVAXTRY", "DOGETRY",
+                  "LINKTRY", "DOTTRY", "TRXTRY", "LTCTRY")
+TREND_MAKS_POZISYON = 4
+TREND_ILK_STOP_ATR = 2.0
+TREND_TAKIP_ATR = 3.0
+TREND_EMA = 50
+TREND_ATR_PERIYOT = 20
+TREND_VARYANTLARI = [
+    # (ad, kirilim gunu, BTC filtresi, coinler (None = hepsi))
+    ("20 gun kirilim + BTC filtresi", 20, True, None),
+    ("50 gun kirilim + BTC filtresi", 50, True, None),
+    ("20 gun kirilim, BTC filtresi yok", 20, False, None),
+    ("20 gun kirilim, sadece BTC + ETH", 20, True, ("BTCTRY", "ETHTRY")),
+]
+
+
+def _ema_hizali(degerler: list, periyot: int) -> list:
+    """degerler ile ayni uzunlukta EMA; yeterli veri olmayan basta None."""
+    seri = ema_serisi(degerler, periyot)
+    return [None] * (len(degerler) - len(seri)) + seri
+
+
+def _atr_serisi(yuksek: list, dusuk: list, kapanis: list, periyot: int) -> list:
+    """Wilder ATR, kapanis ile ayni uzunlukta (basta None)."""
+    atr, sonuc = None, [None] * len(kapanis)
+    trler = []
+    for i in range(1, len(kapanis)):
+        tr = max(yuksek[i] - dusuk[i], abs(yuksek[i] - kapanis[i - 1]), abs(dusuk[i] - kapanis[i - 1]))
+        if atr is None:
+            trler.append(tr)
+            if len(trler) == periyot:
+                atr = sum(trler) / periyot
+        else:
+            atr = (atr * (periyot - 1) + tr) / periyot
+        sonuc[i] = atr
+    return sonuc
+
+
+def trend_simule_et(coin_gunluk: dict, btc_gunluk: Optional[dict], bas_ms: int, bitis_ms: int, sermaye: float,
+                    kirilim: int = 20, btc_filtresi: bool = True, coinler: Optional[tuple] = None) -> dict:
+    """Gunluk mumlarla trend takibi simulasyonu. Kararlar gun kapanisinda (o gune kadarki veriyle),
+    stoplar ertesi gunden itibaren gecerli. Donus backtest_simule_et ile ayni bicimde."""
+    gun_ms = ARALIK_MS["1d"]
+    hazir = {}
+    for s, v in coin_gunluk.items():
+        if (coinler and s not in coinler) or not v or len(v["zaman"]) < max(TREND_EMA, kirilim) + 2:
+            continue
+        hazir[s] = {"v": v, "idx": {z: i for i, z in enumerate(v["zaman"])},
+                    "ema": _ema_hizali(v["kapanis"], TREND_EMA),
+                    "atr": _atr_serisi(v["yuksek"], v["dusuk"], v["kapanis"], TREND_ATR_PERIYOT)}
+    btc_yukari = {}
+    if btc_gunluk and btc_gunluk.get("zaman"):
+        e = _ema_hizali(btc_gunluk["kapanis"], TREND_EMA)
+        btc_yukari = {z: e[i] is not None and btc_gunluk["kapanis"][i] > e[i]
+                      for i, z in enumerate(btc_gunluk["zaman"])}
+    nakit, acik, islemler, son_fiyat = sermaye, {}, [], {}
+    zirve, en_derin = sermaye, 0.0
+    sayac = {"komisyon": 0.0, "acil_fren": False, "acik_gun": 0, "toplam_gun": 0}
+
+    def sat(s: str, fiyat: float, etiket: str, t_ms: int) -> None:
+        nonlocal nakit
+        p = acik.pop(s)
+        brut = p["miktar"] * fiyat * (1 - BACKTEST_SLIPAJ_PCT)
+        kom = brut * KOMISYON_PCT
+        nakit += brut - kom
+        sayac["komisyon"] += kom
+        pnl = brut - kom - p["tutar"] - p["kom"]
+        islemler.append(islem_kaydi_olustur(
+            s, "TEST", datetime.fromtimestamp(p["giris_ms"] / 1000), datetime.fromtimestamp(t_ms / 1000),
+            p["giris"], fiyat, p["tutar"], pnl, p["miktar"] * (p["giris"] - p["ilk_stop"]),
+            (p["giris"] - p["ilk_stop"]) / p["giris"], etiket, False, False, {}))
+
+    t = bas_ms - bas_ms % gun_ms
+    while t + gun_ms <= bitis_ms:
+        kapanis_ms = t + gun_ms
+        # 1) acik pozisyonlar: gunun dusugu stop'a degdiyse cik, degmediyse takip eden stop'u yukselt
+        for s in list(acik):
+            i = hazir[s]["idx"].get(t)
+            if i is None:
+                continue
+            v, p = hazir[s]["v"], acik[s]
+            son_fiyat[s] = v["kapanis"][i]
+            if v["dusuk"][i] <= p["stop"]:
+                sat(s, min(p["stop"], v["acilis"][i]),
+                    "TRAILING-STOP" if p["stop"] > p["giris"] else "STOP-LOSS", kapanis_ms)
+                continue
+            p["zirve"] = max(p["zirve"], v["yuksek"][i])
+            atr = hazir[s]["atr"][i]
+            if atr:
+                p["stop"] = max(p["stop"], p["zirve"] - TREND_TAKIP_ATR * atr)
+        for s, h in hazir.items():
+            i = h["idx"].get(t)
+            if i is not None:
+                son_fiyat[s] = h["v"]["kapanis"][i]
+        # 2) portfoy ve acil fren
+        deger = nakit + sum(p["miktar"] * son_fiyat[s] for s, p in acik.items())
+        sayac["toplam_gun"] += 1
+        sayac["acik_gun"] += bool(acik)
+        zirve = max(zirve, deger)
+        en_derin = max(en_derin, (zirve - deger) / zirve if zirve > 0 else 0.0)
+        if zirve > 0 and (zirve - deger) / zirve >= MAX_DRAWDOWN_PCT:
+            for s in list(acik):
+                sat(s, son_fiyat[s], "ACIL-TASFIYE", kapanis_ms)
+            sayac["acil_fren"] = True
+            break
+        # 3) yeni girisler (gun kapanisinda)
+        bos = TREND_MAKS_POZISYON - len(acik)
+        if bos > 0 and (not btc_filtresi or btc_yukari.get(t, False)):
+            adaylar = []
+            for s, h in hazir.items():
+                i = h["idx"].get(t)
+                if s in acik or i is None or i < kirilim:
+                    continue
+                v, atr, ema = h["v"], h["atr"][i], h["ema"][i]
+                kap = v["kapanis"][i]
+                if atr and ema and kap > ema and kap > max(v["yuksek"][i - kirilim:i]):
+                    adaylar.append((kap / v["kapanis"][max(0, i - 60)] - 1, s, kap, atr))
+            for _, s, kap, atr in sorted(adaylar, reverse=True)[:bos]:
+                giris = kap * (1 + BACKTEST_SLIPAJ_PCT)
+                stop = giris - TREND_ILK_STOP_ATR * atr
+                stop_pct = (giris - stop) / giris
+                if not (0 < stop_pct < 0.5):
+                    continue
+                risk_tutari = deger * RISK_PCT / stop_pct if RISK_PCT > 0 else deger
+                tutar = min(risk_tutari, deger / TREND_MAKS_POZISYON, nakit / (1 + KOMISYON_PCT))
+                if tutar < MIN_POZISYON_TUTARI_TRY:
+                    continue
+                kom = tutar * KOMISYON_PCT
+                nakit -= tutar + kom
+                sayac["komisyon"] += kom
+                acik[s] = {"giris": giris, "miktar": tutar / giris, "tutar": tutar, "kom": kom, "stop": stop,
+                           "ilk_stop": stop, "zirve": giris, "giris_ms": kapanis_ms}
+        t += gun_ms
+    for s in list(acik):
+        sat(s, son_fiyat[s], "TEST-SONU", min(t, bitis_ms))
+    return {"baslangic": sermaye, "bitis": nakit, "islemler": islemler, "en_derin_dusus": en_derin,
+            "sayac": sayac}
+
+
+def trend_kiyasi(coin_gunluk: dict, bas_ms: int, bitis_ms: int) -> str:
+    """Ayni donemde al-tut: BTC ve tum coinler esit agirlikli."""
+    btc = _donem_degisimi(coin_gunluk.get("BTCTRY"), bas_ms, bitis_ms)
+    hepsi = [d for d in (_donem_degisimi(v, bas_ms, bitis_ms) for v in coin_gunluk.values()) if d is not None]
+    return ((f"BTC al-tut %{btc:+.1f}, " if btc is not None else "")
+            + f"coinlerin hepsini al-tut %{_ortalama(hepsi):+.1f}")
+
+
+def trend_komutu(argumanlar: list) -> int:
+    """'trend [DONEM_GUN] [SERMAYE]': gunluk trend takibini ardisik 4 donemde (varsayilan 4 x 180 gun = 2 yil)
+    TREND_VARYANTLARI ile test eder."""
+    sayilar = []
+    for a in argumanlar:
+        try:
+            sayilar.append(float(a.replace(",", ".")))
+        except ValueError:
+            pass
+    donem_gun = int(_aralikta(sayilar[0], 60, 365)) if sayilar else 180
+    sermaye = sayilar[1] if len(sayilar) > 1 and sayilar[1] > 0 else BACKTEST_VARSAYILAN_SERMAYE
+    print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
+    print(f"{BOLD}{CYAN}{'PROJECT AURELIUS v20 - GUNLUK TREND TAKIBI TESTI'.center(74)}{RESET}")
+    print(f"{BOLD}{CYAN}{'=' * 74}{RESET}")
+    gun_ms = ARALIK_MS["1d"]
+    son_ms = int(time.time() * 1000) // gun_ms * gun_ms
+    sinirlar = [son_ms - k * donem_gun * gun_ms for k in (4, 3, 2, 1, 0)]
+    donemler = [(f"{i}. donem", sinirlar[i - 1], sinirlar[i]) for i in (1, 2, 3, 4)]
+    print(f"  {_tarih(sinirlar[0])} - {_tarih(son_ms)}: 4 donem x {donem_gun} gun, {sermaye:,.0f} TL sanal sermaye, "
+          f"islem basina risk %{RISK_PCT * 100:g}, en fazla {TREND_MAKS_POZISYON} pozisyon.")
+    print(f"  Coinler: {', '.join(c[:-3] for c in TREND_COINLERI)}. Emir gonderilmez.\n")
+    isinma = (max(TREND_EMA, 50) + 30) * gun_ms
+    coin_gunluk = {}
+    for n, s in enumerate(TREND_COINLERI, start=1):
+        print(f"  [{n}/{len(TREND_COINLERI)}] {s} gunluk mumlari indiriliyor...", flush=True)
+        try:
+            v = gecmis_mumlari_getir(s, "1d", sinirlar[0] - isinma, son_ms)
+        except Exception as e:
+            print(f"{YELLOW}    {s} atlandi ({e}){RESET}")
+            continue
+        if v:
+            coin_gunluk[s] = v
+    try:
+        btc_gunluk = gecmis_mumlari_getir("BTCUSDT", "1d", sinirlar[0] - isinma, son_ms)
+    except Exception:
+        btc_gunluk = coin_gunluk.get("BTCTRY")
+    if not coin_gunluk:
+        print(f"{RED}Hicbir coin icin gecmis veri alinamadi (internet / Binance TR erisimini kontrol edin).{RESET}")
+        return CIKIS_DUR
+    sonuclar = {}
+    for ad, kirilim, btc_filtresi, coinler in TREND_VARYANTLARI:
+        for donem_adi, b, e in donemler:
+            sonuclar[(ad, donem_adi)] = trend_simule_et(coin_gunluk, btc_gunluk, b, e, sermaye, kirilim,
+                                                        btc_filtresi, coinler)
+    tum = {ad: trend_simule_et(coin_gunluk, btc_gunluk, sinirlar[0], son_ms, sermaye, k, f, c)
+           for ad, k, f, c in TREND_VARYANTLARI}
+    print(f"\n{CYAN}{'-' * 74}{RESET}")
+    print(f"{BOLD}  SONUC ({len(coin_gunluk)} coin){RESET}")
+    print(f"{CYAN}{'-' * 74}{RESET}")
+    for satir in strateji_satirlari(sonuclar, donemler, {}, None, [v[0] for v in TREND_VARYANTLARI],
+                                    lambda b, e: trend_kiyasi(coin_gunluk, b, e)):
+        print(f"  {satir}")
+    print()
+    print(f"  Tum {4 * donem_gun} gun boyunca kesintisiz ({sermaye:,.0f} TL ile):  "
+          + trend_kiyasi(coin_gunluk, sinirlar[0], son_ms))
+    for ad, _, _, _ in TREND_VARYANTLARI:
+        s = tum[ad]
+        print(f"    {ad:<36}: {s['bitis']:>10,.2f} TL ({(s['bitis'] / sermaye - 1) * 100:+.1f}%), "
+              f"en derin dusus %{s['en_derin_dusus'] * 100:.1f}, {len(s['islemler'])} islem"
+              + (" - ACIL FREN" if s["sayac"]["acil_fren"] else ""))
+    print(f"{CYAN}{'-' * 74}{RESET}")
+    print(f"{GRAY}  Varsayimlar: gunluk mumlar; giris gun kapanisinda, stop ertesi gunden itibaren; komisyon "
+          f"%{KOMISYON_PCT * 100:g} + kayma %{BACKTEST_SLIPAJ_PCT * 100:.3g} her alim/satimda.{RESET}")
+    print(f"{GRAY}  Al-tut kiyasi risk sinirsizdir (tum para coinde); bot ise islem basina %{RISK_PCT * 100:g} risk "
+          f"alir, dususu cok daha kucuk olmalidir.{RESET}")
+    print(f"{YELLOW}  Gecmis sonuc gelecegi garanti etmez.{RESET}\n")
+    return CIKIS_DUR
+
+
 def rapor_komutu() -> int:
     """'rapor': islem gunlugunun tum zamanlar ve son 30 gun ozeti."""
     tumu = islem_gunlugunu_oku()
@@ -6336,6 +6561,8 @@ def main():
             kod = karsilastir_komutu(sys.argv[2:])
         elif komut == "strateji":
             kod = strateji_komutu(sys.argv[2:])
+        elif komut == "trend":
+            kod = trend_komutu(sys.argv[2:])
         elif komut == "baglanti":
             baglanti_testi()
             kod = CIKIS_DUR
