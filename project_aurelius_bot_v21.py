@@ -5019,6 +5019,7 @@ TELEGRAM_YARDIM_METNI = (
     "/hepsinisat - tum pozisyonlari piyasa fiyatindan sat (onay ister)\n"
     "/analiz SEMBOL - coinin detayli analizi (orn. /analiz PEPETRY)\n"
     "/btc - BTC piyasa rejimi\n"
+    "/trend - coinlerin alim sinyaline (50 gunluk zirveye) uzakligi\n"
     "/rapor - son 30 gunun islem ozeti (islem gunlugunden)\n"
     "/frensifirla - acil fren referansini bugunku portfoy degerine cek\n"
     "/yardim - bu liste"
@@ -5097,6 +5098,9 @@ def telegram_komutunu_uygula(komut: str, kasa: "MerkeziKasa", pozisyonlar: dict,
         return
     if komut == "/btc":
         send_telegram("<pre>" + html.escape("\n".join(btc_raporu_satirlari(btc_rejim_analizi()))) + "</pre>")
+        return
+    if komut == "/trend":
+        send_telegram("<pre>" + html.escape("\n".join(trend_durumu_satirlari(pozisyonlar))) + "</pre>")
         return
     if komut == "/frensifirla":
         portfoy = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
@@ -6717,6 +6721,10 @@ def trend_gunluk_kontrol(kasa: "MerkeziKasa", pozisyonlar: dict, acik_pozisyon_s
                 alinanlar.append(s)
         if not adaylar:
             satirlar.append(f"Yeni sinyal yok ({TREND_KIRILIM_GUN} gunluk zirveyi kiran coin yok).")
+    yakin = [y for y in trend_yakinlik(gunluk) if y[0] not in pozisyonlar or not pozisyonlar[y[0]].has_open_position]
+    if yakin and not alinanlar:
+        satirlar.append("Zirveye en yakin: " + ", ".join(f"{s[:-3]} %{max(0.0, u):.1f}" for s, _, _, u, _ in yakin[:3])
+                        + " (ayrinti: /trend)")
     _trend_durumu["son_gun"] = bugun
     _trend_durumu["son_kontrol"] = datetime.now().isoformat(timespec="minutes")
     _trend_durumu["btc_yukari"] = btc_yukari
@@ -6730,6 +6738,64 @@ def trend_gunluk_kontrol(kasa: "MerkeziKasa", pozisyonlar: dict, acik_pozisyon_s
     send_telegram("\U0001F4C5 <b>Gunluk trend kontrolu</b>\n" + html.escape(baslik)
                   + "".join(f"\n- {html.escape(x)}" for x in satirlar))
     return True
+
+
+def trend_yakinlik(gunluk: dict, fiyatlar: Optional[dict] = None) -> list:
+    """Her coin icin alim sinyaline uzaklik: (sembol, zirve_seviyesi, fiyat, uzaklik_pct, ema50_ustu).
+    Sinyal icin bir sonraki gunluk kapanis son TREND_KIRILIM_GUN gunun en yuksegini gecmeli. Yakindan uzaga."""
+    sonuc = []
+    for s, v in gunluk.items():
+        if s not in TREND_COINLERI or not v or len(v["kapanis"]) < max(TREND_EMA, TREND_KIRILIM_GUN) + 1:
+            continue
+        seviye = max(v["yuksek"][-TREND_KIRILIM_GUN:])
+        ema = _ema_hizali(v["kapanis"], TREND_EMA)[-1]
+        fiyat = (fiyatlar or {}).get(s) or v["kapanis"][-1]
+        sonuc.append((s, seviye, fiyat, (seviye / fiyat - 1) * 100, ema is not None and fiyat > ema))
+    return sorted(sonuc, key=lambda x: x[3])
+
+
+def trend_durumu_satirlari(pozisyonlar: Optional[dict] = None) -> list:
+    """/trend: BTC filtresi ve her coinin 50 gunluk zirveye (alim sinyaline) uzakligi."""
+    gun_ms = ARALIK_MS["1d"]
+    bugun = int(time.time() * 1000) // gun_ms * gun_ms
+    gunluk, fiyatlar = {}, {}
+    for s in TREND_COINLERI:
+        try:
+            v = _gunluk_mumlar(s, bugun, TREND_GUNLUK_MUM)
+            if v:
+                gunluk[s] = v
+                fiyatlar[s] = get_last_price(s)
+        except Exception as e:
+            logger.warning("/trend: %s verisi alinamadi: %s", s, e)
+    btc_yukari = None
+    try:
+        btc = _gunluk_mumlar("BTCUSDT", bugun, TREND_GUNLUK_MUM)
+        if btc:
+            ema_btc = _ema_hizali(btc["kapanis"], TREND_EMA)[-1]
+            btc_yukari = ema_btc is not None and btc["kapanis"][-1] > ema_btc
+    except Exception as e:
+        logger.warning("/trend: BTC verisi alinamadi: %s", e)
+    satirlar = [
+        "BTC filtresi: " + ("EMA50 ustunde - alim serbest" if btc_yukari else
+                            "EMA50 altinda - yeni alim yok" if btc_yukari is False else "veri alinamadi"),
+        f"Alim sarti: gunluk kapanis son {TREND_KIRILIM_GUN} gunun zirvesini gecmeli (kontrol her gun ~03:05)",
+        "",
+    ]
+    for s, seviye, fiyat, uzaklik, ema_ustu in trend_yakinlik(gunluk, fiyatlar):
+        coin = s[:-3]
+        bot = (pozisyonlar or {}).get(s)
+        if bot is not None and bot.has_open_position:
+            _, stop, _ = bot.acik_hedef_ve_stop()
+            satirlar.append(f"{coin:<5} POZISYONDA, stop {format_fiyat(stop)}")
+        elif uzaklik <= 0:
+            satirlar.append(f"{coin:<5} zirvenin %{-uzaklik:.1f} USTUNDE - kapanis boyle kalirsa sinyal"
+                            + ("" if ema_ustu else " (ama EMA50 altinda)"))
+        else:
+            satirlar.append(f"{coin:<5} zirveye %{uzaklik:.1f} kaldi ({format_fiyat(seviye)} TRY)"
+                            + ("" if ema_ustu else ", EMA50 altinda"))
+    if not gunluk:
+        satirlar.append("Coin verileri alinamadi, biraz sonra tekrar deneyin.")
+    return satirlar
 
 
 def _trend_turu(kasa: "MerkeziKasa", pozisyonlar: dict, acik_pozisyon_sayaci: list, kaydet, rapor) -> None:
