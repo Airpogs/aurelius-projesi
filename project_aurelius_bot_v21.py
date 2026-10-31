@@ -2,6 +2,17 @@
 PROJECT AURELIUS - v21
 Binance TR otomatik alim-satim botu
 ======================================================================
+v21.1 - GUVENLIK GUNCELLEMESI (ayni dosya adi, kurulum gerekmez):
+  1) Borsa stop emri trend stratejisinde VARSAYILAN ACIK: her trend pozisyonu icin Binance TR'ye
+     STOP_LOSS_LIMIT satis emri konur (tetik bot stop'unun %1 alti, limit tetigin %3 alti). Bot veya
+     bilgisayar kapaliyken de zarar borsada kesilir; stop her gun yukseldikce emir de yukari tasinir.
+     Kapatmak icin AURELIUS_BORSA_STOP=0. Emir turu resmi dokumanla dogrulanmadigi icin her kurulumdan
+     sonra emir sorgulanir: hemen gerceklestiyse veya borsa baska bir tur bildirirse borsa stop KALICI
+     kapatilir, Telegram'a uyari gider ve bot kendi stop'uyla korumaya devam eder.
+  2) Gunluk kontrolde bir coinin ya da BTC'nin verisi alinamazsa gun "yapildi" sayilmaz: 2 saat
+     boyunca 10 dk arayla tekrar denenir (eskiden o gunun sinyali kacabiliyordu).
+  3) Haftalik ozet: her pazartesi gunluk kontrolden sonra (bot o gun kapaliysa sonraki ilk kontrolde)
+     Telegram'a portfoy degisimi, son 7 gunun islemleri ve acik pozisyonlarin stoplari gider. /hafta.
 v21 - GUNLUK TREND TAKIBI (VARSAYILAN STRATEJI):
   Gecmis veri testlerinde v19/v20'nin kisa vadeli stratejisi hicbir ayarla kar etmedi (cok fazla kucuk
   islem, masraflar ve oynak coinlerde stop). Gunluk trend takibi ise 3 yillik testte (4 x 270 gun) her
@@ -817,7 +828,8 @@ HEPSINI_SAT_ONAY_SANIYE = 60
 # (5) Borsada bekleyen koruyucu stop emri - varsayilan KAPALI, AURELIUS_BORSA_STOP=1 ile
 #     acilir. Tetik fiyati botun kendi stop'unun BORSA_STOP_TAMPON_PCT altindadir: bot
 #     calisirken once kendi stop'u satar, bot kapaliyken borsadaki emir satar.
-BORSA_STOP_AKTIF = _ortam_degiskeni_str_oku("AURELIUS_BORSA_STOP") == "1"
+_BORSA_STOP_AYARI = _ortam_degiskeni_str_oku("AURELIUS_BORSA_STOP")
+BORSA_STOP_AKTIF = _BORSA_STOP_AYARI == "1"   # trend stratejisinde varsayilan ACIK (asagida)
 BORSA_STOP_TAMPON_PCT = 0.01
 BORSA_STOP_LIMIT_ARALIK_PCT = 0.01      # limit fiyati tetigin bu kadar altinda (dolma sansi icin)
 BORSA_STOP_GUNCELLEME_ESIGI_PCT = 0.01  # bot stop'u bu kadar yukselince borsadaki emir yukseltilir
@@ -866,6 +878,13 @@ TREND_KONTROL_GECIKME_DK = 5        # gunluk mum 00:00 UTC'de (TR 03:00) kapanir
 TREND_KOVALAMA_ATR = 0.5            # fiyat sinyal kapanisindan 0.5 x ATR'den fazla kactiysa girilmez
 TREND_GUNLUK_MUM = 300              # gunluk kontrolde cekilen gecmis (tek istek)
 _trend_durumu: dict = {}            # {"son_gun": ms} - durum dosyasina kaydedilir
+TREND_VERI_TEKRAR_SAAT = 2          # eksik veride gunluk kontrol bu sure boyunca tekrar denenir
+TREND_VERI_TEKRAR_DK = 10
+TREND_BORSA_STOP_LIMIT_ARALIK_PCT = 0.03  # gunluk stratejide hizli dususte de dolsun diye daha genis
+# v21.1: trend pozisyonlari gunlerce acik kalir; bot/bilgisayar kapaliyken de korunmalari icin borsa
+# stop emri trend stratejisinde VARSAYILAN ACIK (kapatmak icin AURELIUS_BORSA_STOP=0).
+if TREND_MODU and _BORSA_STOP_AYARI != "0":
+    BORSA_STOP_AKTIF = True
 
 REAL_POLL_INTERVAL_SECONDS = 25
 SUB_TICK_SECONDS = 2
@@ -2384,7 +2403,7 @@ def _emir_bilgisi(data: dict) -> dict:
         durum = None
     miktar, tutar = sayi("executedQty"), sayi("executedQuoteQty")
     fiyat = tutar / miktar if (miktar and tutar) else (sayi("avgPrice") or sayi("executedPrice"))
-    return {"status": durum, "executedQty": miktar, "executedPrice": fiyat}
+    return {"status": durum, "executedQty": miktar, "executedPrice": fiyat, "tip": data.get("type")}
 
 
 def binance_stop_limit_satis_emri(symbol: str, quantity: float, stop_fiyati: float,
@@ -2410,6 +2429,11 @@ def binance_stop_limit_satis_emri(symbol: str, quantity: float, stop_fiyati: flo
     if emir_id in (None, "", 0):
         raise RuntimeError(f"Binance TR stop emri yanitinda emir numarasi (orderId) yok: {data!r}")
     return str(emir_id)
+
+
+def _borsa_stop_kullanilabilir() -> bool:
+    """Borsa stop emri kurulabilir/yukseltilebilir mi (v21.1: dogrulama hatasinda kalici kapanir)."""
+    return CANLI_MOD and BORSA_STOP_AKTIF and not _trend_durumu.get("borsa_stop_kapali")
 
 
 def binance_emir_iptal(emir_id: str) -> dict:
@@ -2995,14 +3019,31 @@ class CoinBot:
         altinda - bot calisirken once kendi stop'u devreye girer."""
         stop, _ = self._ratchet_stop_hesapla(level)
         tetik = stop * (1 - BORSA_STOP_TAMPON_PCT)
-        return tetik, tetik * (1 - BORSA_STOP_LIMIT_ARALIK_PCT)
+        aralik = TREND_BORSA_STOP_LIMIT_ARALIK_PCT if level.trend_stop > 0 else BORSA_STOP_LIMIT_ARALIK_PCT
+        return tetik, tetik * (1 - aralik)
+
+    def _borsa_stop_dogrula(self, emir_id: str) -> Optional[str]:
+        """v21.1: emir turu kodu resmi dokumanla dogrulanmadi. Yeni kurulan emir hemen gerceklestiyse
+        ya da borsa baska bir emir turu bildiriyorsa sorunu dondurur (yanlis tur pozisyonu erken satar)."""
+        time.sleep(1.0)
+        try:
+            bilgi = binance_emir_sorgula(emir_id)
+        except Exception as e:
+            logger.warning("Borsa stop dogrulama sorgusu yapilamadi (%s): %s", self.symbol, e)
+            return None  # periyodik sorgu devam eder
+        tip = str(bilgi.get("tip") if bilgi.get("tip") is not None else "").strip().upper()
+        if bilgi.get("status") in (1, 2) or bilgi.get("executedQty"):
+            return "kurulan emir fiyat stop'a inmeden hemen gerceklesti"
+        if tip and tip not in ("4", "STOP_LOSS_LIMIT"):
+            return f"borsa emir turunu '{tip}' olarak bildirdi (beklenen STOP_LOSS_LIMIT)"
+        return None
 
     def borsa_stopunu_kur(self, level: "GridLevel", zorla: bool = False,
                           durum_kaydet: Optional[object] = None) -> bool:
         """Seviye icin borsada STOP_LOSS_LIMIT satis emri kurar. Basarisizlikta bot
         kendi stop'uyla korumaya devam eder; BORSA_STOP_HATA_BEKLEME_SANIYE sonra
         tekrar denenir."""
-        if not (CANLI_MOD and BORSA_STOP_AKTIF) or not level.has_position or level.borsa_stop_emir_id:
+        if not _borsa_stop_kullanilabilir() or not level.has_position or level.borsa_stop_emir_id:
             return False
         simdi = time.monotonic()
         if (not zorla and level.borsa_stop_hata_sayisi
@@ -3050,11 +3091,31 @@ class CoinBot:
         level.borsa_stop_miktari = miktar
         level.borsa_stop_hata_sayisi = 0
         level.borsa_stop_son_sorgu = simdi
+        sorun = self._borsa_stop_dogrula(emir_id)
+        if sorun:
+            _trend_durumu["borsa_stop_kapali"] = sorun  # durum dosyasina kaydedilir: yeniden baslatmada da kapali
+            print(f"{RED}{BOLD}  BORSA STOP KAPATILDI ({self.symbol}): {sorun}. Bot kendi stop'uyla korumaya "
+                  f"devam ediyor.{RESET}")
+            logger.error("Borsa stop kapatildi (%s): %s", self.symbol, sorun)
+            if "gerceklesti" in sorun:
+                level.borsa_stop_son_sorgu = 0.0  # satis borsada oldu: bir sonraki bakimda muhasebeye islenir
+            else:
+                durum, _ = self.borsa_stopunu_iptal_et(level)
+                if durum == "DOLDU":
+                    level.borsa_stop_emir_id = emir_id
+                    level.borsa_stop_son_sorgu = 0.0
+            send_telegram(f"\u26a0\ufe0f <b>Borsa stop emri kapatildi</b> ({self.symbol})\n{html.escape(sorun)}.\n"
+                          f"Pozisyonlar botun kendi stop'uyla korunmaya devam ediyor; bot kapaliyken koruma yok. "
+                          f"Binance TR'de acik emirlerinizi kontrol edin ve bu mesaji Claude'a iletin.")
+            if durum_kaydet is not None:
+                durum_kaydet()
+            return False
         print(f"{GREEN}  BORSA STOP kuruldu ({self.symbol}): {_sayi_metni(miktar)} adet, tetik "
               f"{format_fiyat(tetik)} / limit {format_fiyat(limit)} TRY (emir {emir_id}){RESET}")
         if ilk_kurulum:
             send_telegram(f"\U0001F6E1 <b>{self.symbol} borsa stop emri kuruldu</b>\n"
-                          f"Tetik: {format_fiyat(tetik)} TRY - bot kapali olsa bile borsa bu fiyatta satar.")
+                          f"Tetik: {format_fiyat(tetik)} TRY - bot kapali olsa bile borsa bu fiyatta satar.\n"
+                          f"Binance TR'de Emirler > Acik emirler bolumunde gorebilirsiniz.")
         if durum_kaydet is not None:
             durum_kaydet()  # emir numarasi kaybolmasin (yetim emir coinleri kilitli tutar)
         return True
@@ -3123,7 +3184,7 @@ class CoinBot:
             if not level.borsa_stop_emir_id:
                 yeni_alim = (self.alis_zamani is not None
                              and (datetime.now() - self.alis_zamani).total_seconds() < 20)
-                if BORSA_STOP_AKTIF and yeni_kur and not yeni_alim:  # alinan coin hesaba gecsin
+                if _borsa_stop_kullanilabilir() and yeni_kur and not yeni_alim:  # alinan coin hesaba gecsin
                     self.borsa_stopunu_kur(level, durum_kaydet=durum_kaydet)
                 continue
             if zorla_sorgu or simdi - level.borsa_stop_son_sorgu >= BORSA_STOP_SORGU_SANIYE:
@@ -3142,7 +3203,7 @@ class CoinBot:
                           f"{EMIR_DURUMLARI.get(bilgi['status'])}) - yeniden kurulacak.{RESET}")
                     level.borsa_stop_emir_id = None
                     continue
-            if not BORSA_STOP_AKTIF:
+            if not _borsa_stop_kullanilabilir():
                 continue
             tetik, _ = self._borsa_koruma_fiyatlari(level)
             if (tetik > level.borsa_stop_fiyati * (1 + BORSA_STOP_GUNCELLEME_ESIGI_PCT)
@@ -5021,6 +5082,7 @@ TELEGRAM_YARDIM_METNI = (
     "/btc - BTC piyasa rejimi\n"
     "/trend - coinlerin alim sinyaline (50 gunluk zirveye) uzakligi\n"
     "/rapor - son 30 gunun islem ozeti (islem gunlugunden)\n"
+    "/hafta - haftalik ozet (her pazartesi kendiliginden de gelir)\n"
     "/frensifirla - acil fren referansini bugunku portfoy degerine cek\n"
     "/yardim - bu liste"
 )
@@ -5038,6 +5100,8 @@ def durum_ozeti_metni(kasa: "MerkeziKasa", pozisyonlar: dict) -> str:
         f"Yeni alimlar: {ALIM_DURUMU_ACIKLAMA.get(_alim_durumu, _alim_durumu)}",
     ] + ([html.escape(trend_durum_satiri())] if TREND_MODU else []) \
       + [html.escape(satir) for satir in _risk.durum_satirlari(portfoy)]
+    if CANLI_MOD and BORSA_STOP_AKTIF and _trend_durumu.get("borsa_stop_kapali"):
+        satirlar.append("UYARI: borsa stop emri kapali - " + html.escape(str(_trend_durumu["borsa_stop_kapali"])))
     acik = [b for b in pozisyonlar.values() if b.has_open_position]
     if not acik:
         satirlar.append("Acik pozisyon yok.")
@@ -5101,6 +5165,9 @@ def telegram_komutunu_uygula(komut: str, kasa: "MerkeziKasa", pozisyonlar: dict,
         return
     if komut == "/trend":
         send_telegram("<pre>" + html.escape("\n".join(trend_durumu_satirlari(pozisyonlar))) + "</pre>")
+        return
+    if komut == "/hafta":
+        send_telegram(haftalik_ozet_metni(kasa, pozisyonlar))
         return
     if komut == "/frensifirla":
         portfoy = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
@@ -6622,6 +6689,12 @@ def trend_gunluk_kontrol(kasa: "MerkeziKasa", pozisyonlar: dict, acik_pozisyon_s
     bugun = simdi_ms // gun_ms * gun_ms
     if _trend_durumu.get("son_gun") == bugun or simdi_ms - bugun < TREND_KONTROL_GECIKME_DK * 60_000:
         return False
+    # v21.1: eksik veride (borsa/ag sorunu) gun hemen "yapildi" sayilmaz; 10 dk arayla tekrar denenir
+    if simdi_ms - _trend_durumu.get("son_deneme_ms", 0) < TREND_VERI_TEKRAR_DK * 60_000:
+        return False
+    if _trend_durumu.get("ilk_deneme_ms", 0) < bugun:
+        _trend_durumu["ilk_deneme_ms"] = simdi_ms
+    tekrar_suresi_var = simdi_ms - _trend_durumu["ilk_deneme_ms"] < TREND_VERI_TEKRAR_SAAT * 3_600_000
     gerekli = TREND_GUNLUK_MUM  # ATR/EMA testteki gibi uzun gecmisle hesaplansin
     acik_trend = [s for s, b in pozisyonlar.items()
                   if b.has_open_position and any(l.has_position and l.trend_stop > 0 for l in b.grid)]
@@ -6636,7 +6709,9 @@ def trend_gunluk_kontrol(kasa: "MerkeziKasa", pozisyonlar: dict, acik_pozisyon_s
             gunluk[s] = v
         time.sleep(API_CALL_SLEEP_SECONDS)
     if not gunluk:
-        print(f"[{ts()}] {YELLOW}Trend kontrolu: gunluk mumlar alinamadi, sonraki turda tekrar denenecek.{RESET}")
+        _trend_durumu["son_deneme_ms"] = simdi_ms
+        print(f"[{ts()}] {YELLOW}Trend kontrolu: gunluk mumlar alinamadi, {TREND_VERI_TEKRAR_DK} dk sonra "
+              f"tekrar denenecek.{RESET}")
         return False
     btc_yukari = None
     try:
@@ -6646,7 +6721,17 @@ def trend_gunluk_kontrol(kasa: "MerkeziKasa", pozisyonlar: dict, acik_pozisyon_s
             btc_yukari = ema_btc is not None and btc["kapanis"][-1] > ema_btc
     except Exception as e:
         logger.warning("Trend: BTC gunluk verisi alinamadi: %s", e)
+    eksik = [s[:-3] for s in dict.fromkeys(list(TREND_COINLERI) + acik_trend) if s not in gunluk]
+    if TREND_BTC_FILTRESI and btc_yukari is None:
+        eksik.append("BTC filtresi")
     satirlar = []
+    if eksik:
+        if tekrar_suresi_var:
+            _trend_durumu["son_deneme_ms"] = simdi_ms
+            print(f"[{ts()}] {YELLOW}Trend kontrolu: {', '.join(eksik)} verisi alinamadi, {TREND_VERI_TEKRAR_DK} dk "
+                  f"sonra tekrar denenecek.{RESET}")
+            return False
+        satirlar.append(f"Verisi alinamayan: {', '.join(eksik)} (bugun bunlar icin islem yapilmadi)")
 
     # 1) acik trend pozisyonlarinin stop'unu yukselt (zirve - 3 x ATR; asla asagi inmez)
     for s in acik_trend:
@@ -6737,7 +6822,45 @@ def trend_gunluk_kontrol(kasa: "MerkeziKasa", pozisyonlar: dict, acik_pozisyon_s
         print(f"    {satir}")
     send_telegram("\U0001F4C5 <b>Gunluk trend kontrolu</b>\n" + html.escape(baslik)
                   + "".join(f"\n- {html.escape(x)}" for x in satirlar))
+    son_haftalik = _trend_durumu.get("son_haftalik", 0)
+    if son_haftalik != bugun and (time.gmtime(bugun / 1000).tm_wday == 0
+                                  or (son_haftalik and bugun - son_haftalik >= 7 * gun_ms)):
+        send_telegram(haftalik_ozet_metni(kasa, pozisyonlar))
+        _trend_durumu["son_haftalik"] = bugun
+        _trend_durumu["hafta_portfoy"] = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
+        durum_kaydet()
     return True
+
+
+def haftalik_ozet_metni(kasa: "MerkeziKasa", pozisyonlar: dict) -> str:
+    """v21.1: her pazartesi (gunluk kontrolden sonra) ve /hafta ile gonderilen haftalik ozet."""
+    portfoy = v9_toplam_portfoy_degeri(kasa, pozisyonlar)
+    onceki = _trend_durumu.get("hafta_portfoy")
+    satirlar = [f"Portfoy: {portfoy:,.2f} TRY | Nakit: {kasa.bakiye:,.2f} TRY"]
+    if onceki:
+        satirlar.append(f"Son ozetten bu yana: {portfoy - onceki:+,.2f} TRY (%{(portfoy / onceki - 1) * 100:+.1f})")
+    if kasa.baslangic:
+        satirlar.append(f"Baslangictan bu yana ({kasa.baslangic:,.2f} TRY): {portfoy - kasa.baslangic:+,.2f} TRY "
+                        f"(%{(portfoy / kasa.baslangic - 1) * 100:+.1f})")
+    kayitlar = islem_gunlugunu_oku(gun=7)
+    satirlar.append("")
+    satirlar += (["Son 7 gun:"] + islem_ozeti_satirlari(kayitlar)[:3]) if kayitlar else ["Son 7 gunde kapanan islem yok."]
+    acik = [b for b in pozisyonlar.values() if b.has_open_position]
+    satirlar.append("")
+    satirlar.append(f"Acik pozisyon: {len(acik)}" + ("" if acik else " (sinyal bekleniyor, /trend)"))
+    for b in acik:
+        seviye = next((lvl for lvl in b.grid if lvl.has_position), None)
+        if seviye is None or not seviye.buy_price:
+            continue
+        fiyat = b.guncel_fiyat()
+        stop, _ = b._ratchet_stop_hesapla(seviye)
+        satirlar.append(f"- {b.symbol[:-3]}: %{(fiyat / seviye.buy_price - 1) * 100:+.1f}, stop {format_fiyat(stop)}"
+                        + (" (giris ustunde, zarar ihtimali yok)" if stop > seviye.buy_price * (1 + 2 * KOMISYON_PCT)
+                           else f" (stop olursa %{(stop / seviye.buy_price - 1) * 100:+.1f})")
+                        + (", borsada stop emri var" if seviye.borsa_stop_emir_id else ""))
+    if BORSA_STOP_AKTIF and _trend_durumu.get("borsa_stop_kapali"):
+        satirlar.append(f"UYARI: borsa stop emri kapali ({_trend_durumu['borsa_stop_kapali']})")
+    return "\U0001F4CA <b>Haftalik ozet</b>\n<pre>" + html.escape("\n".join(satirlar)) + "</pre>"
 
 
 def trend_yakinlik(gunluk: dict, fiyatlar: Optional[dict] = None) -> list:
