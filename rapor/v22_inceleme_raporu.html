@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aurelius v22 İnceleme Raporu</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --ring: rgba(11,11,11,0.10);
+  --onemli: #b3302f; --onemli-bg: #fdf1ee; --orta: #8a5a00; --orta-bg: #fbf3e2; --iyi: #1c5cab; --iyi-bg: #eef4fc;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --ring: rgba(255,255,255,0.10);
+    --onemli: #f09a9a; --onemli-bg: #2a1d1b; --orta: #e9c27a; --orta-bg: #2a2416; --iyi: #86b6ef; --iyi-bg: #17202c;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --ring: rgba(255,255,255,0.10);
+  --onemli: #f09a9a; --onemli-bg: #2a1d1b; --orta: #e9c27a; --orta-bg: #2a2416; --iyi: #86b6ef; --iyi-bg: #17202c;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 17px; margin: 30px 0 10px; }
+.alt { color: var(--ink-2); margin: 0 0 18px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+.tile { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 12px 14px; }
+.tile .k { color: var(--ink-2); font-size: 13px; }
+.tile .v { font-size: 21px; font-weight: 650; margin-top: 2px; }
+.tile .s { color: var(--muted); font-size: 12.5px; }
+.bulgu { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 12px 14px; margin-top: 10px; }
+.bulgu h3 { font-size: 15px; margin: 0 0 6px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.etiket { font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+.e-onemli { color: var(--onemli); background: var(--onemli-bg); }
+.e-orta { color: var(--orta); background: var(--orta-bg); }
+.e-kucuk { color: var(--iyi); background: var(--iyi-bg); }
+.bulgu p { margin: 4px 0; }
+.bulgu b { font-weight: 600; }
+ul { padding-left: 20px; margin: 6px 0; }
+li { margin-bottom: 6px; }
+.vurgu { background: var(--iyi-bg); border-radius: 10px; padding: 12px 14px; margin-top: 12px; }
+code { font-size: 13px; background: var(--grid); padding: 1px 5px; border-radius: 4px; }
+.not { font-size: 13.5px; color: var(--ink-2); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Aurelius v21 İnceleme Raporu</h1>
+  <p class="alt">v22 hazırlanmadan önce · tüm kod (7.088 satır) baştan sona okundu · kodda henüz hiçbir değişiklik yapılmadı</p>
+
+  <div class="tiles">
+    <div class="tile"><div class="k">Para kaybettiren hata</div><div class="v">Yok</div><div class="s">ciddi bir açık bulunmadı</div></div>
+    <div class="tile"><div class="k">Düzeltilecek eksik</div><div class="v">7</div><div class="s">2'si önemli</div></div>
+    <div class="tile"><div class="k">Kullanılmayan kod</div><div class="v">~%55</div><div class="s">~7.100 → ~3.000 satır</div></div>
+  </div>
+
+  <h2>Bulunan eksikler ve nasıl düzelteceğim</h2>
+
+  <div class="bulgu">
+    <h3>1. Stop tek bir işlemin fiyatına bakıyor <span class="etiket e-onemli">Önemli</span></h3>
+    <p><b>Sorun:</b> Bot fiyatı borsadaki "son tek işlemden" alıyor. TRY paritelerinde ara sıra çok küçük ve fiyatı anormal bir işlem olabiliyor. Böyle bir işlem, fiyat aslında stopa inmemişken satışı tetikleyebilir.</p>
+    <p><b>Çözüm:</b> Satmadan önce emir defterindeki en iyi alış fiyatına da bakılacak. Gerçekten stopun altındaysa satılacak. Defter okunamazsa bot güvenli tarafta kalıp yine satacak.</p>
+  </div>
+
+  <div class="bulgu">
+    <h3>2. Gerçekleşen alış/satış fiyatı kaydedilmiyor <span class="etiket e-onemli">Önemli</span></h3>
+    <p><b>Sorun:</b> Bot emir gönderdikten sonra borsanın gerçekte hangi fiyattan ve kaç adet doldurduğunu okumuyor. Bunun yerine tahmini bir fiyat kullanıyor. Bu yüzden giriş fiyatı, stop mesafesi ve kâr/zarar kayıtları biraz sapabiliyor.</p>
+    <p><b>Çözüm:</b> Emirden sonra borsanın yanıtından (gerekirse emri sorgulayarak) gerçekleşen miktar ve ortalama fiyat okunacak. Okunamazsa eskisi gibi tahmin kullanılacak.</p>
+  </div>
+
+  <div class="bulgu">
+    <h3>3. Coin borsada yoksa bot durmadan satmaya çalışıyor <span class="etiket e-orta">Orta</span></h3>
+    <p><b>Sorun:</b> Pozisyondaki coini Binance TR'den elle satarsanız, bot bunu en geç 6 saat sonra fark ediyor. O zamana kadar her 25 saniyede bir satmayı deniyor. Fark ettiğinde de pozisyonu sessizce kapatıyor ve işlem günlüğe yazılmıyor.</p>
+    <p><b>Çözüm:</b> Satış sırasında coin borsada yoksa pozisyon hemen kapatılacak, nakit borsadaki gerçek bakiyeyle eşitlenecek, işlem günlüğe yazılacak ve size bir kez Telegram mesajı gelecek.</p>
+  </div>
+
+  <div class="bulgu">
+    <h3>4. Aynı hata Telegram'a defalarca gelebiliyor <span class="etiket e-orta">Orta</span></h3>
+    <p><b>Sorun:</b> Borsa bir emri sürekli reddederse (bakım, API izni vb.) bot her 25 saniyede tekrar dener ve her seferinde "CANLI EMIR BASARISIZ" mesajı gönderir. Bu da saatte 100'den fazla mesaj demek.</p>
+    <p><b>Çözüm:</b> Bot denemeye devam edecek, ama aynı coin için bu mesaj en fazla 30 dakikada bir gelecek.</p>
+  </div>
+
+  <div class="bulgu">
+    <h3>5. Beklenmedik tek bir hata botu tamamen kapatıyor <span class="etiket e-orta">Orta</span></h3>
+    <p><b>Sorun:</b> Ana döngüde öngörülmemiş bir hata olursa bot kapanıyor. <code>baslat.sh</code> onu 60 saniye sonra yeniden açıyor, ama o arada stop takibi duruyor. Bot başka bir yoldan açıldıysa da kapalı kalıyor.</p>
+    <p><b>Çözüm:</b> Tek turdaki hata kaydedilip bir sonraki turda devam edilecek, Telegram'a en fazla saatte bir haber verilecek. Hata art arda 20 kez olursa bot yine durur ve yeniden başlatılır.</p>
+  </div>
+
+  <div class="bulgu">
+    <h3>6. Gereksiz kayıt ve ekran kalabalığı <span class="etiket e-kucuk">Küçük</span></h3>
+    <p><b>Sorun:</b> Performans tablosu ekrana ve portföy kayıt dosyasına 75 saniyede bir yazılıyor. Bu, yılda ~400.000 satır demek. Günlük stratejide bu kadar sık yazmanın bir faydası yok.</p>
+    <p><b>Çözüm:</b> 30 dakikada bir yazılacak.</p>
+  </div>
+
+  <div class="bulgu">
+    <h3>7. Eski ve artık yanlış açıklamalar <span class="etiket e-kucuk">Küçük</span></h3>
+    <p><b>Sorun:</b> Ctrl+C ile kapatırken çıkan soru hâlâ "bot kapalıyken stop çalışmaz" diyor. Oysa artık borsa stopu var. Dosyanın başındaki 540 satırlık sürüm geçmişinin bir kısmı da artık doğru değil (örneğin "emir durumu sorgulanmaz" yazıyor).</p>
+    <p><b>Çözüm:</b> Kısa ve güncel bir açıklama yazılacak.</p>
+  </div>
+
+  <h2>Çıkarılacak kullanılmayan kısımlar</h2>
+  <p>Bunların hepsi v21'den beri kapalı. Bot trend stratejisiyle çalışırken hiçbiri devreye girmiyor:</p>
+  <ul>
+    <li><b>Eski kısa vadeli strateji:</b> piyasa taraması, 4 zaman dilimli detaylı analiz ve puanlama, BTC rejim analizi, hedef 1/hedef 2 kâr alma, 18 saat zaman aşımı, RSI beklemesi, satış sonrası bekleme süresi (cooldown), "sniper/kademe" pozisyon modeli, giriş kartı. Geçmiş veri testlerinde her ayarda kaybettirdi.</li>
+    <li><b>v8–v16'dan kalan grid kodları:</b> grid kurma, eski kâr-al ve kademeli kâr alma, simüle fiyat üretimi.</li>
+    <li><b>Sadece eski stratejide çalışan korumalar:</b> günlük zarar limiti, art arda kayıp molası, coin engeli. Trend modunda zaten uygulanmıyorlardı, çünkü trend testinde yoklardı.</li>
+    <li><b>Eski stratejinin komutları:</b> konsolda <code>backtest</code>, <code>karsilastir</code>, <code>strateji</code>, <code>analiz</code>; Telegram'da <code>/analiz</code>. <code>/btc</code> kalacak, ama sadece BTC trend filtresini gösterecek.</li>
+    <li><b><code>AURELIUS_STRATEJI=KISA</code> ayarı.</b></li>
+  </ul>
+
+  <div class="vurgu">
+    <b>Değişmeyecekler:</b>
+    <ul>
+      <li><b>Strateji kuralları:</b> 50 günlük zirve kırılımı, EMA50 ve BTC filtresi, 2×ATR stop, zirve − 3×ATR takip eden stop, işlem başına %1 risk, en fazla 4 pozisyon. Bunlar değişirse 3 yıllık test sonucu geçerliliğini yitirir.</li>
+      <li><b>Korumalar:</b> borsa stopu, acil fren, veri hatasında tekrar deneme.</li>
+      <li><b>Telegram komutları:</b> /durum /trend /hafta /rapor /alimdurdur /devam /bosalt /hepsinisat /frensifirla /yardim.</li>
+      <li><b>Raporlar ve konsol komutları:</b> günlük/aylık raporlar; <code>trend</code> testi, <code>rapor</code>, <code>baglanti</code>, <code>kurulum</code>.</li>
+      <li><b>Kayıt dosyaları:</b> durum dosyası ve işlem günlüğü aynı biçimde kalacak. ADA pozisyonunuz v22'de aynen devam eder.</li>
+    </ul>
+  </div>
+
+  <h2>Bundan sonra</h2>
+  <ul>
+    <li>v22'yi bu rapora göre hazırlayıp test edeceğim. Ardından neyin yapıldığını gösteren son raporu ve dosyayı göndereceğim.</li>
+    <li>Dosyanın adı <code>project_aurelius_bot_v22.py</code> olacak. Chromebook'ta <code>baslat.sh</code> dosyasındaki adı tek bir komutla güncellemeniz gerekecek. Komutu son mesajda vereceğim. API anahtarlarını yeniden girmeniz gerekmeyecek.</li>
+  </ul>
+  <p class="not">Bu inceleme kodun kendisini kapsıyor. Stratejinin gelecekte kâr getireceğini garanti etmez.</p>
+</main>
+</body>
+</html>
