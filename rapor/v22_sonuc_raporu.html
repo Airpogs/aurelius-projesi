@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aurelius v22 Sonuç Raporu</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --ring: rgba(11,11,11,0.10);
+  --onemli: #b3302f; --onemli-bg: #fdf1ee; --orta: #8a5a00; --orta-bg: #fbf3e2; --iyi: #1c5cab; --iyi-bg: #eef4fc;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --ring: rgba(255,255,255,0.10);
+    --onemli: #f09a9a; --onemli-bg: #2a1d1b; --orta: #e9c27a; --orta-bg: #2a2416; --iyi: #86b6ef; --iyi-bg: #17202c;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --ring: rgba(255,255,255,0.10);
+  --onemli: #f09a9a; --onemli-bg: #2a1d1b; --orta: #e9c27a; --orta-bg: #2a2416; --iyi: #86b6ef; --iyi-bg: #17202c;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 17px; margin: 30px 0 10px; }
+.alt { color: var(--ink-2); margin: 0 0 18px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+.tile { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 12px 14px; }
+.tile .k { color: var(--ink-2); font-size: 13px; }
+.tile .v { font-size: 21px; font-weight: 650; margin-top: 2px; }
+.tile .s { color: var(--muted); font-size: 12.5px; }
+.bulgu { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 12px 14px; margin-top: 10px; }
+.bulgu h3 { font-size: 15px; margin: 0 0 6px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.etiket { font-size: 12px; font-weight: 600; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+.e-onemli { color: var(--onemli); background: var(--onemli-bg); }
+.e-orta { color: var(--orta); background: var(--orta-bg); }
+.e-kucuk { color: var(--iyi); background: var(--iyi-bg); }
+.bulgu p { margin: 4px 0; }
+.bulgu b { font-weight: 600; }
+ul { padding-left: 20px; margin: 6px 0; }
+li { margin-bottom: 6px; }
+.vurgu { background: var(--iyi-bg); border-radius: 10px; padding: 12px 14px; margin-top: 12px; }
+code { font-size: 13px; background: var(--grid); padding: 1px 5px; border-radius: 4px; }
+.not { font-size: 13.5px; color: var(--ink-2); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Aurelius v22 Sonuç Raporu</h1>
+  <p class="alt">İnceleme raporundaki her madde için yapılan değişiklik · 44 otomatik test ve canlı mod açılış testi geçti</p>
+
+  <div class="tiles">
+    <div class="tile"><div class="k">Düzeltilen eksik</div><div class="v">7 / 7</div><div class="s">hepsi test edildi</div></div>
+    <div class="tile"><div class="k">Kod boyutu</div><div class="v">7.088 → 4.043</div><div class="s">satır (−%43)</div></div>
+    <div class="tile"><div class="k">Testler</div><div class="v">44 / 44</div><div class="s">+ canlı açılış testi</div></div>
+  </div>
+  <p class="not">İlk raporda kodun ~3.000 satıra ineceğini tahmin etmiştim. Gerçekte 4.043 satır oldu. Bağlantı teşhisi, API anahtarı kontrolleri, mutabakat ve raporlar gibi hâlâ kullanılan altyapı kodu korundu.</p>
+
+  <h2>Eksikler: ne yapıldı</h2>
+
+  <div class="bulgu">
+    <h3>1. Stop tek işlemin fiyatına bakıyordu <span class="etiket e-onemli">Düzeltildi</span></h3>
+    <p>Fiyat stopa indiğinde bot artık önce emir defterindeki en iyi alış fiyatına bakıyor. En iyi alış hâlâ stopun üstündeyse satmıyor. Ekrana "tek işlemlik sapma, satılmadı" yazıyor ve fiyatı izlemeye devam ediyor. Defter okunamazsa güvenli tarafta kalıp satıyor.</p>
+    <p class="not">Test: sapma varken satış yok · gerçek düşüşte satış · defter okunamazsa satış · fiyat stopun üstündeyken deftere hiç bakılmıyor.</p>
+  </div>
+  <div class="bulgu">
+    <h3>2. Gerçekleşen fiyat kaydedilmiyordu <span class="etiket e-onemli">Düzeltildi</span></h3>
+    <p>Emirden sonra gerçekleşen miktar ve ortalama fiyat borsanın yanıtından okunuyor. Yanıtta yoksa emir bir kez sorgulanıyor. Giriş fiyatı, stop ve kâr/zarar artık gerçek değerlerle hesaplanıyor. Borsa mantıksız bir değer bildirirse eski tahmin yöntemi kullanılıyor.</p>
+    <p class="not">Test: alımda ve satışta gerçek fiyat kullanılıyor · yanıtta yoksa sorgu yapılıyor · mantıksız değerde tahmine dönülüyor.</p>
+  </div>
+  <div class="bulgu">
+    <h3>3. Borsada olmayan coin için sonsuz satış denemesi <span class="etiket e-orta">Düzeltildi</span></h3>
+    <p>Coin borsada yoksa satış emri gönderilmiyor. Pozisyon kapatılıyor, nakit borsadaki gerçek TRY bakiyesine eşitleniyor, işlem günlüğe "BORSADA-YOK" olarak yazılıyor ve Telegram'a bir kez mesaj geliyor. Mutabakatta fark edilen kaybolan coin de aynı şekilde işleniyor. Coin açık bir emirde kilitliyse "borsada yok" sayılmıyor.</p>
+  </div>
+  <div class="bulgu">
+    <h3>4. Telegram'a hata yağmuru <span class="etiket e-orta">Düzeltildi</span></h3>
+    <p>Bot reddedilen emri denemeye devam ediyor, ama aynı coin için uyarı en fazla 30 dakikada bir geliyor. Emir başarılı olunca sayaç sıfırlanıyor.</p>
+  </div>
+  <div class="bulgu">
+    <h3>5. Tek bir hata botu kapatıyordu <span class="etiket e-orta">Düzeltildi</span></h3>
+    <p>Beklenmedik bir hatada o tur atlanıyor ve bot çalışmaya devam ediyor. Telegram'a en fazla saatte bir haber veriliyor. Bir coindeki hata diğer coinlerin stop kontrolünü engellemiyor. Hata art arda 20 turda olursa bot duruyor ve <code>baslat.sh</code> onu yeniden açıyor.</p>
+  </div>
+  <div class="bulgu">
+    <h3>6. Kayıt ve ekran kalabalığı <span class="etiket e-kucuk">Düzeltildi</span></h3>
+    <p>Performans tablosu ve portföy kaydı 75 saniye yerine 30 dakikada bir yazılıyor. Pozisyon yaşı 48 saatten sonra gün olarak gösteriliyor (örneğin "25g").</p>
+  </div>
+  <div class="bulgu">
+    <h3>7. Eski açıklamalar <span class="etiket e-kucuk">Düzeltildi</span></h3>
+    <p>540 satırlık sürüm geçmişi yerine kısa ve güncel bir açıklama var. Ctrl+C sorusu artık borsa stopundan bahsediyor. Mesajlardaki "stop/kâr-al" ifadeleri düzeltildi.</p>
+  </div>
+
+  <h2>Çıkarılanlar</h2>
+  <ul>
+    <li>Eski kısa vadeli stratejinin tamamı: tarama, detaylı analiz, puanlama, BTC rejimi, hedef 1/2, zaman aşımı, RSI beklemesi, cooldown, sniper/kademe modeli, giriş kartı.</li>
+    <li>v8–v16 grid kodları ve simüle fiyat üretimi.</li>
+    <li>Sadece eski stratejide çalışan günlük zarar limiti, kayıp molası ve coin engeli.</li>
+    <li>Komutlar: <code>backtest</code>, <code>karsilastir</code>, <code>strateji</code>, <code>analiz</code> ve Telegram <code>/analiz</code>. Bunlar yazılırsa "v22'de kaldırıldı" mesajı çıkıyor.</li>
+    <li><code>AURELIUS_STRATEJI</code> ayarı. Artık tek strateji var.</li>
+  </ul>
+
+  <h2>Eklenen küçük şeyler</h2>
+  <ul>
+    <li><b><code>/btc</code>:</b> BTC'nin dünkü kapanışını, EMA50'yi ve BTC filtresinin alımlara izin verip vermediğini gösteriyor.</li>
+    <li><b><code>trend</code> testi:</b> sonuç tablosunun ilk satırı artık canlıda kullanılan ayar.</li>
+    <li><b>Testler artık projede:</b> <code>testler/</code> klasöründe duruyor; <code>bash testler/calistir.sh</code> komutuyla çalıştırılabilir.</li>
+    <li><b>Eski pozisyon aktarımı:</b> v21'den önceki bir stratejiden açık pozisyon kaldıysa trend kurallarına aktarılıyor.</li>
+  </ul>
+
+  <div class="vurgu">
+    <b>Değişmeyenler:</b>
+    <ul>
+      <li>Strateji kuralları, işlem başına %1 risk, en fazla 4 pozisyon, acil fren, borsa stopu.</li>
+      <li>Durum dosyası ve işlem günlüğü aynı biçimde kalıyor. v21'den kalan ADA pozisyonu ve borsadaki stop emri v22'de aynen devam ediyor; bu ayrıca test edildi.</li>
+    </ul>
+  </div>
+  <p class="not">Testlerde borsa yanıtları taklit edildi (bu ortamdan Binance TR'ye bağlanılamıyor). Gerçek emirlerin doğrulaması hesabınızdaki ilk işlemlerde yapılacak.</p>
+</main>
+</body>
+</html>
